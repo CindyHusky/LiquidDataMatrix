@@ -1,2 +1,2 @@
 # LeaningSpacePOC
-it allows ai to take in and understand arbitrary data by mimicking the thalamus in function
+it allows ai to take in and understand arbitrary data by mimicing the thalamus in function
