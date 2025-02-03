@@ -104,25 +104,6 @@ def decide_action(learning_space, curiosity_reward):
     else:
         return np.random.choice([1, 2])  # Turn left or right
 
-def perform_action(action):
-    """Simulate keyboard inputs for movement."""
-    if action == 0:
-        keyboard.press('w')
-        time.sleep(0.1)
-        keyboard.release('w')
-    elif action == 1:
-        keyboard.press('a')
-        time.sleep(0.1)
-        keyboard.release('a')
-    elif action == 2:
-        keyboard.press('d')
-        time.sleep(0.1)
-        keyboard.release('d')
-    elif action == 3:
-        keyboard.press(Key.space)
-        time.sleep(0.1)
-        keyboard.release(Key.space)
-
 # === MAIN LOOP ===
 
 cap = cv2.VideoCapture(0)
