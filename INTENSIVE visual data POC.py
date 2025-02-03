@@ -1,5 +1,5 @@
 #i forgor i was adapting the visual model for minecraft gameplay heres a less danegerous one lol
-
+#you need obs webcam for this btw
 
 import cv2
 import numpy as np
