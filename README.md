@@ -1,5 +1,6 @@
 # LeaningSpacePOC
 it allows ai to take in and understand arbitrary data by mimicing the thalamus in function
+which could allow for agi like capabilities
 
 
 i used ai to make the program yes(deepseek and gpt)
