@@ -12,3 +12,5 @@ it acts as a psudo thalamus able to take in multiple forms of arbitrary data at 
 
 
 it is to my knowledge nobody has tried this
+https://docs.google.com/document/d/1XZb5JXi3HcbAMMhFzEIpalIXwE36qla2JZPnN9-QQiY/edit?usp=sharing
+Heres a link to my research if you want to see very poor handwriting
