@@ -1,4 +1,8 @@
-#fixed long term memory so it actually does something
+#updates: 
+#long term actually does stuff now
+#applyed smoothing to long term to allow for more perceptron data bleed
+
+
 import cv2
 import numpy as np
 
@@ -21,13 +25,11 @@ DECAY_FACTOR = 0.99               # Factor by which old memories fade
 MAX_MEMORY = 100                  # Maximum number of images stored in memory
 
 # Memory recall parameters (for human-like, reconstructive recall)
-SIMILARITY_THRESHOLD = 15         # Minimum similarity score (after weighting) to consider a memory relevant
+SIMILARITY_THRESHOLD = 15         # Minimum similarity threshold for a memory to be relevant
 SIMILARITY_SCALE = 50.0           # Scale factor for converting histogram differences to similarity weights
 
 # === INITIAL SETUP ===
-# Create an empty learning space (grayscale image in float32).
 learning_space = np.zeros(LEARNING_SPACE_SIZE, dtype=np.float32)
-# Long-term memory: each element will be a grayscale image.
 long_term_memory = []
 
 # === HELPER FUNCTIONS ===
@@ -76,46 +78,27 @@ def advanced_explore_learning_space(learning_space, new_frame):
       5. Optionally, smooth the result for a more network-like appearance.
     """
     new_frame_float = new_frame.astype(np.float32)
-    
-    # Decay the current learning space.
     decayed = learning_space * DECAY_LEARNING
-    
-    # Compute the pixelwise difference.
     diff = cv2.absdiff(new_frame_float, decayed)
-    
-    # Create a mask where the difference exceeds DIFF_THRESHOLD (values: 0 or 1).
     _, mask = cv2.threshold(diff, DIFF_THRESHOLD, 1, cv2.THRESH_BINARY)
-    
-    # Weighted update: areas with high difference get an extra boost.
     updated = decayed * BASE_BLEND + new_frame_float * (1 - BASE_BLEND + mask * NOVEL_BLEND)
-    
-    # Smooth the result for a network-like appearance.
     updated = cv2.GaussianBlur(updated, (3, 3), 0)
-    
     return updated
 
 def recall_similar_memories(current_state, memory_frames):
     """
-    Mimic human-like memory recall: instead of simply returning memories that are below a threshold,
-    compute a similarity score based on histogram differences and reconstruct a composite memory.
-    
-    Returns:
-      - A composite (weighted average) image of recalled memories if similar memories exist,
-      - None if no memories are similar enough.
+    Mimic human-like memory recall by reconstructing a composite memory
+    that is a weighted blend of stored memories, then apply additional smoothing
+    to reduce sharpness and simulate the vagueness of human memory recall.
     """
     current_uint8 = current_state.astype(np.uint8)
     hist_current = calc_normalized_histogram(current_uint8)
     
-    # List to store tuples of (similarity_weight, memory_frame)
     weighted_memories = []
-    
     for mem in memory_frames:
         mem_uint8 = mem.astype(np.uint8)
         hist_mem = calc_normalized_histogram(mem_uint8)
-        # Compute L1 difference between histograms.
         diff = np.sum(np.abs(hist_current - hist_mem))
-        # Convert difference to a similarity weight.
-        # A lower difference gives a higher weight.
         weight = np.exp(-diff / SIMILARITY_SCALE)
         if weight > np.exp(-SIMILARITY_THRESHOLD / SIMILARITY_SCALE):
             weighted_memories.append((weight, mem.astype(np.float32)))
@@ -123,11 +106,13 @@ def recall_similar_memories(current_state, memory_frames):
     if not weighted_memories:
         return None
 
-    # Reconstruct a composite memory by computing the weighted average of similar memories.
-    total_weight = sum([w for w, _ in weighted_memories])
+    total_weight = sum(w for w, _ in weighted_memories)
     composite_memory = np.zeros_like(current_state, dtype=np.float32)
     for weight, mem in weighted_memories:
         composite_memory += mem * (weight / total_weight)
+    
+    # Apply extra smoothing to mimic the vagueness of human memory recall.
+    composite_memory = cv2.GaussianBlur(composite_memory, (5, 5), 0)
     
     return composite_memory
 
@@ -136,10 +121,9 @@ def update_long_term_memory(memory, current_state):
     Update the long-term memory with the current state.
     Memories are first decayed, then:
       - If there is room, add the new state.
-      - If at capacity, compare histogram differences and importance (based on pairwise differences)
-        to decide whether to replace the least "important" memory.
+      - If at capacity, compare histogram differences and importance to decide
+        whether to replace the least "important" memory.
     """
-    # Decay each memory.
     decayed_memory = [state * DECAY_FACTOR for state in memory]
     current_float = current_state.astype(np.float32)
     
@@ -147,20 +131,14 @@ def update_long_term_memory(memory, current_state):
         decayed_memory.append(current_float)
         print(f"Memory added. Total memories: {len(decayed_memory)}.")
     else:
-        # Compute histograms for all memories and the current state.
         hist_current = calc_normalized_histogram(current_float.astype(np.uint8))
-        hist_list = []
-        for mem in decayed_memory:
-            hist_mem = calc_normalized_histogram(mem.astype(np.uint8))
-            hist_list.append(hist_mem)
-        hist_array = np.stack(hist_list, axis=0)  # shape: (N, 256)
+        hist_list = [calc_normalized_histogram(mem.astype(np.uint8)) for mem in decayed_memory]
+        hist_array = np.stack(hist_list, axis=0)
         
-        # Compute novelty of the current state (average L1 difference to stored histograms).
-        diffs = np.sum(np.abs(hist_array - hist_current), axis=1)  # shape: (N,)
+        diffs = np.sum(np.abs(hist_array - hist_current), axis=1)
         novelty_new = np.mean(diffs)
         
-        # Compute importance for each memory based on pairwise histogram differences.
-        pairwise = np.sum(np.abs(hist_array[:, None, :] - hist_array[None, :, :]), axis=2)  # shape: (N, N)
+        pairwise = np.sum(np.abs(hist_array[:, None, :] - hist_array[None, :, :]), axis=2)
         importance = (np.sum(pairwise, axis=1) - np.diag(pairwise)) / (len(decayed_memory) - 1)
         
         min_index = np.argmin(importance)
@@ -189,33 +167,22 @@ while True:
         break
 
     frame_count += 1
-
-    # Resize frame and convert to grayscale.
     frame_resized = cv2.resize(frame, LEARNING_SPACE_SIZE, interpolation=cv2.INTER_AREA)
     gray_frame = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
 
-    # Update the learning space.
     learning_space = advanced_explore_learning_space(learning_space, gray_frame)
-
-    # Calculate curiosity reward based on histogram novelty.
     curiosity_reward, raw_novelty = calculate_curiosity_reward(gray_frame, long_term_memory)
     if curiosity_reward > 0:
         print(f"[Frame {frame_count}] Novelty reward: {curiosity_reward:.3f} (raw novelty: {raw_novelty:.3f})")
     
-    # Human-like memory recall: reconstruct a composite memory.
     composite_memory = recall_similar_memories(gray_frame, long_term_memory)
     if composite_memory is not None:
-        # For visualization, we can show the composite memory.
         cv2.imshow('Recalled Memory (Composite)', composite_memory.astype(np.uint8))
         print(f"[Frame {frame_count}] Recalled composite memory from {len(long_term_memory)} stored memories.")
     else:
-        # No similar memories found.
         cv2.imshow('Recalled Memory (Composite)', np.zeros_like(gray_frame))
     
-    # Update the long-term memory with the current frame.
     long_term_memory = update_long_term_memory(long_term_memory, gray_frame)
-
-    # Display the learning space and the current frame.
     cv2.imshow('Learning Space', learning_space.astype(np.uint8))
     cv2.imshow('Current Frame', gray_frame)
 
