@@ -3,8 +3,7 @@ import matplotlib.pyplot as plt
 import random
 from tqdm import tqdm  # progress bar
 from scipy.ndimage import gaussian_filter  # For applying the radial (Gaussian) blur
-#THIS IS GPT MADE CODE
-#THIS VERSION IS SUPPOSED TO USE A BLURRING SYSTEM TO SHARE PERCEPTRON DATA 
+
 # -----------------------------
 # Utility Functions
 # -----------------------------
@@ -76,7 +75,7 @@ class NeuralNetwork:
         dloss_db2 = np.clip(dloss_db2, -max_grad_value, max_grad_value)
         
         # Update weights using gradient descent
-        learning_rate = 0.001
+        learning_rate = 0.0001
         self.W1 -= learning_rate * dloss_dW1
         self.b1 -= learning_rate * dloss_db1
         self.W2 -= learning_rate * dloss_dW2
@@ -270,3 +269,4 @@ if __name__ == "__main__":
     
     # Adjust epochs, batch_size, and visualization interval as needed.
     nn.train(samples, epochs=50000, batch_size=1, vis_interval=10000)
+
