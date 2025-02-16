@@ -1,0 +1,154 @@
+#still half functional because i cant figure out desktop audio input
+
+#plz help 
+
+
+import numpy as np
+import cv2
+import pyaudio
+import threading
+
+# --- Audio Capture Class using PyAudio ---
+class AudioCapture:
+    """
+    Captures audio continuously in a separate thread.
+    The latest audio snippet is stored in self.audio_data.
+    """
+    def __init__(self, rate=44100, chunk=1024):
+        self.rate = rate
+        self.chunk = chunk
+        self.audio_data = None
+        self.lock = threading.Lock()
+        self.pa = pyaudio.PyAudio()
+        self.stream = self.pa.open(format=pyaudio.paInt16,
+                                   channels=1,
+                                   rate=self.rate,
+                                   input=True,
+                                   frames_per_buffer=self.chunk,
+                                   stream_callback=self.callback)
+        self.stream.start_stream()
+
+    def callback(self, in_data, frame_count, time_info, status):
+        data = np.frombuffer(in_data, dtype=np.int16)
+        with self.lock:
+            self.audio_data = data  
+        return (in_data, pyaudio.paContinue)
+
+    def get_audio(self):
+        with self.lock:
+            return self.audio_data.copy() if self.audio_data is not None else None
+
+    def close(self):
+        self.stream.stop_stream()
+        self.stream.close()
+        self.pa.terminate()
+
+# --- Perceptron Layer ---
+class PerceptronLayer:
+    """
+    Processes raw video & audio input into a latent representation.
+    """
+    def __init__(self, input_dim, output_dim):
+        self.weights = np.random.randn(input_dim, output_dim).astype(np.float32) * 0.1
+        self.bias = np.random.randn(output_dim).astype(np.float32) * 0.1
+
+    def forward(self, x):
+        z = np.dot(x, self.weights) + self.bias
+        return np.maximum(0, z)  # ReLU activation
+
+# --- Learning Space (Real-Time Persistence) ---
+class LearningSpace:
+    """
+    A persistent learning space that retains memory while adapting to new input.
+    """
+    def __init__(self, img_size, decay=0.95, novelty_factor=0.1):
+        self.img_size = img_size
+        self.state = np.zeros((img_size, img_size), dtype=np.float32)
+        self.decay = decay
+        self.novelty_factor = novelty_factor
+
+    def update(self, update_vector):
+        """
+        Continuously blends new perception with existing state.
+        """
+        update_matrix = update_vector.reshape(self.img_size, self.img_size)
+        
+        # Adjust weight of new information to balance memory & adaptation
+        self.state = (self.decay * self.state) + (self.novelty_factor * update_matrix)
+        self.state = np.clip(self.state, 0, 1)
+        
+        return self.state
+
+# --- Real-Time Perception System ---
+def main():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: Could not open video stream.")
+        return
+
+    audio_capture = AudioCapture(rate=44100, chunk=1024)
+
+    # --- Config ---
+    base_img_size = 16
+    scale_factor =8   # Increased resolution
+    img_size = base_img_size * scale_factor
+    image_dim = img_size * img_size  # 64x64 = 4096
+
+    audio_latent_dim = 16  
+    input_dim = image_dim + audio_latent_dim  
+    output_dim = image_dim  
+
+    pre_perceptron = PerceptronLayer(input_dim, output_dim)
+    learning_space = LearningSpace(img_size, decay=0.95, novelty_factor=0.1)
+    post_perceptron = PerceptronLayer(output_dim, output_dim)
+
+    cv2.namedWindow("Persistent Learning Space", cv2.WINDOW_NORMAL)
+
+    print("Real-time learning space active. Press 'q' to quit.")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # --- Process Video ---
+        frame_resized = cv2.resize(frame, (img_size, img_size))
+        gray_frame = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
+        flat_image = gray_frame.astype(np.float32).flatten() / 255.0
+
+        # --- Process Audio ---
+        audio_chunk = audio_capture.get_audio()
+        if audio_chunk is not None:
+            audio_features = np.mean(np.abs(audio_chunk)) / 32768.0
+            audio_latent = np.full(audio_latent_dim, audio_features, dtype=np.float32)
+        else:
+            audio_latent = np.zeros(audio_latent_dim, dtype=np.float32)
+
+        # --- Pre-Perceptron Stage ---
+        pre_input = np.concatenate([flat_image, audio_latent])
+        pre_output = pre_perceptron.forward(pre_input)
+
+        # --- Learning Space Update (Real-Time Persistence) ---
+        persistent_state = learning_space.update(pre_output)
+
+        # --- Post-Perceptron Stage ---
+        flat_state = persistent_state.flatten()
+        post_output = post_perceptron.forward(flat_state)
+        final_state = post_output.reshape(img_size, img_size)
+        final_state = np.clip(final_state, 0, 1)
+
+        # --- Visualization ---
+        display_state = (final_state * 255).astype(np.uint8)
+        cv2.imshow("Persistent Learning Space", display_state)
+
+        # Quit condition
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    audio_capture.close()
+    cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    main()
+
