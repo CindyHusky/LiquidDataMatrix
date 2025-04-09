@@ -1,3 +1,5 @@
+#use pip install numpy opencv-python pyaudio
+
 import numpy as np
 import cv2
 import pyaudio
