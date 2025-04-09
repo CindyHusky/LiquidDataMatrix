@@ -1,4 +1,4 @@
-#use pip install numpy opencv-python pyaudio
+#use pip install numpy opencv-python pyaudio matplotlib
 
 import numpy as np
 import cv2
