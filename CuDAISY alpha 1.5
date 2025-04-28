@@ -1,0 +1,185 @@
+import os
+import torch
+import torch.nn as nn
+import cv2
+import numpy as np
+
+# --- Configuration ---
+CHECKPOINT_PATH = os.path.join(os.getcwd(), 'cudaisy_checkpoint.pth')  # absolute path to ensure write access
+SEED = 42
+
+# --- Parameters ---
+LEARNING_SPACE_SIZE = (1028, 1028)
+IMG_SIZE = 256
+FLAT_IMG_SIZE = IMG_SIZE * IMG_SIZE
+INPUT_DIM = FLAT_IMG_SIZE
+HIDDEN_DIM = 2048
+DECAY_BASE = 0.98
+RECALL_BLEND = 0.4
+SMOOTHING_ALPHA = 0.95
+NOVELTY_THRESHOLD = 0.5
+MAX_MEMORY = 200
+FORGETTING_RATE = 0.99
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# --- Utilities ---
+def set_seed(seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+# --- Autoencoder Definition ---
+class AutoEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super().__init__()
+        self.encoder = nn.Linear(input_dim, hidden_dim)
+        self.decoder = nn.Linear(hidden_dim, input_dim)
+
+    def forward(self, x):
+        z = torch.relu(self.encoder(x))
+        return torch.sigmoid(self.decoder(z))
+
+# --- Memory Structures ---
+learning_space = torch.zeros(1, 1, *LEARNING_SPACE_SIZE, device=DEVICE)
+previous_space = None
+long_term_memory = []
+memory_strengths = []
+
+# --- Persistence Helpers ---
+def save_checkpoint(autoencoder, optimizer):
+    try:
+        ckpt = {
+            'model': autoencoder.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'learning_space': learning_space.cpu(),
+            'long_term_memory': [m.cpu() for m in long_term_memory],
+            'memory_strengths': memory_strengths,
+        }
+        torch.save(ckpt, CHECKPOINT_PATH)
+        print(f"Checkpoint saved to {CHECKPOINT_PATH}")
+    except Exception as e:
+        print(f"Failed to save checkpoint: {e}")
+
+
+def load_checkpoint(autoencoder, optimizer):
+    global learning_space, previous_space, long_term_memory, memory_strengths
+    if os.path.exists(CHECKPOINT_PATH):
+        ckpt = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
+        autoencoder.load_state_dict(ckpt['model'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        learning_space = ckpt['learning_space'].to(DEVICE)
+        previous_space = learning_space.clone()
+        long_term_memory = [m.to(DEVICE) for m in ckpt['long_term_memory']]
+        memory_strengths = ckpt['memory_strengths']
+        print(f"Loaded checkpoint from {CHECKPOINT_PATH}")
+    else:
+        print("No checkpoint found, starting fresh.")
+
+# --- Memory Functions ---
+def adaptive_decay(space, recall_mask):
+    decay_map = torch.full_like(space, DECAY_BASE)
+    decay_map[recall_mask > 0] = 1.0
+    return space * decay_map
+
+
+def update_learning_space(space, frame, recall_mask):
+    decayed = adaptive_decay(space, recall_mask)
+    return decayed * (1 - RECALL_BLEND) + frame * RECALL_BLEND
+
+
+def recall_memory(memory, strengths):
+    if not memory:
+        empty = torch.zeros_like(learning_space)
+        return empty, empty
+    weighted = sum(m * s for m, s in zip(memory, strengths)) / sum(strengths)
+    mask = (weighted > 0.1).float()
+    return weighted, mask
+
+
+def update_long_term_memory(memory, strengths, frame, novelty):
+    if len(memory) < MAX_MEMORY or novelty > NOVELTY_THRESHOLD:
+        if len(memory) >= MAX_MEMORY:
+            idx = torch.argmin(torch.tensor(strengths)).item()
+            memory[idx] = frame.clone()
+            strengths[idx] = novelty
+        else:
+            memory.append(frame.clone())
+            strengths.append(novelty)
+    else:
+        strengths[:] = [s * FORGETTING_RATE for s in strengths]
+    return memory, strengths
+
+# --- Main Loop (Vision Only) ---
+def main():
+    global learning_space, previous_space, long_term_memory, memory_strengths
+    set_seed(SEED)
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Camera not accessible.")
+        return
+
+    autoencoder = AutoEncoder(INPUT_DIM, HIDDEN_DIM).to(DEVICE)
+    optimizer = torch.optim.Adam(autoencoder.parameters(), lr=1e-4)
+    criterion = nn.MSELoss()
+
+    load_checkpoint(autoencoder, optimizer)
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Preprocess frame
+            gray = cv2.cvtColor(cv2.resize(frame, LEARNING_SPACE_SIZE), cv2.COLOR_BGR2GRAY)
+            frame_tensor = torch.from_numpy(gray).float().unsqueeze(0).unsqueeze(0).to(DEVICE)
+
+            # Recall
+            recalled, recall_mask = recall_memory(long_term_memory, memory_strengths)
+
+            # Novelty computation
+            novelty_val = torch.norm(frame_tensor - recalled) / frame_tensor.numel()
+
+            # Update and smooth learning_space
+            new_space = update_learning_space(learning_space, frame_tensor, recall_mask)
+            if previous_space is not None:
+                learning_space = SMOOTHING_ALPHA * previous_space + (1 - SMOOTHING_ALPHA) * new_space
+            else:
+                learning_space = new_space
+            previous_space = learning_space.clone()
+
+            # Update memory
+            long_term_memory[:], memory_strengths[:] = update_long_term_memory(
+                long_term_memory, memory_strengths, frame_tensor, novelty_val
+            )
+
+            # Autoencoder training
+            img_small = cv2.resize(gray, (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
+            input_tensor = torch.tensor(img_small.flatten()).unsqueeze(0).to(DEVICE)
+            optimizer.zero_grad()
+            output = autoencoder(input_tensor)
+            loss = criterion(output, input_tensor)
+            loss.backward()
+            optimizer.step()
+
+            # Display
+            rec_img = (output[0].detach().cpu().numpy().reshape(IMG_SIZE, IMG_SIZE) * 255).astype(np.uint8)
+            orig_img = (input_tensor[0].detach().cpu().numpy().reshape(IMG_SIZE, IMG_SIZE) * 255).astype(np.uint8)
+            cv2.putText(orig_img, f'Loss: {loss.item():.4f}', (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 1)
+            cv2.putText(orig_img, f'Novelty: {novelty_val:.4f}', (5, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 1)
+
+            cv2.imshow('Learning Space', learning_space[0, 0].detach().cpu().numpy().astype(np.uint8))
+            cv2.imshow('Original Frame', orig_img)
+            cv2.imshow('Reconstructed', rec_img)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+    finally:
+        save_checkpoint(autoencoder, optimizer)
+        cap.release()
+        cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    main()
