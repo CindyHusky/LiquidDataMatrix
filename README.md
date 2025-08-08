@@ -1,5 +1,5 @@
 # LeaningSpacePOC
-The learning space or liquid data matrix allows ai to take in and understand arbitrary data by mimicing the thalamus in function
+The learning space or liquid data matrix allows ai to take in and understand arbitrary data by mimicing the thalamus in function using a liquid data vector
 which could allow for agi like capabilities
 
 i used ai to make the program yes(deepseek and gpt)
