@@ -1,272 +1,185 @@
+"""
+Liquid Data Matrix
+------------------
+A NumPy-based feedforward neural network that learns to solve
+multistep basic math operations and visualizes both its
+"learning space" and loss curve.
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
-import random
-from tqdm import tqdm  # progress bar
-from scipy.ndimage import gaussian_filter  # For applying the radial (Gaussian) blur
+from tqdm import tqdm
+from scipy.ndimage import gaussian_filter
+
 
 # -----------------------------
 # Utility Functions
 # -----------------------------
 def softmax(x):
-    # Numerically stable softmax.
     exp_x = np.exp(x - np.max(x, axis=1, keepdims=True))
     return exp_x / np.sum(exp_x, axis=1, keepdims=True)
 
+
 def cross_entropy_loss(predictions, targets):
-    # predictions: probability distribution from softmax.
-    # targets: one-hot encoded target.
-    # Add a small epsilon to avoid log(0)
     epsilon = 1e-12
     predictions = np.clip(predictions, epsilon, 1. - epsilon)
     return -np.sum(targets * np.log(predictions)) / predictions.shape[0]
 
+
+def create_one_hot_encoding(result, max_value):
+    result = max(1, min(result, max_value))
+    one_hot = np.zeros(max_value)
+    one_hot[result - 1] = 1
+    return one_hot
+
+
 # -----------------------------
-# Neural Network Definition
+# Liquid Data Matrix Core
 # -----------------------------
-class NeuralNetwork:
-    def __init__(self, input_size, hidden_size, output_size, colormap="viridis"):
+class LiquidDataMatrix:
+    def __init__(self, input_size, hidden_size, output_size,
+                 colormap="viridis", learning_rate=1e-4,
+                 max_grad_value=1.0, blur_sigma=1.0):
+
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.output_size = output_size
         self.colormap = colormap
+        self.learning_rate = learning_rate
+        self.max_grad_value = max_grad_value
+        self.blur_sigma = blur_sigma
 
-        # Initialize weights and biases (small random values)
         self.W1 = np.random.randn(input_size, hidden_size) * 0.01
         self.b1 = np.zeros((1, hidden_size))
         self.W2 = np.random.randn(hidden_size, output_size) * 0.01
         self.b2 = np.zeros((1, output_size))
 
-        # Double learning space: shape = (hidden_size*2, output_size*2)
         self.learning_space = np.zeros((hidden_size * 2, output_size * 2))
+        self._kron_tile = np.ones((2, 2))
+
+        # Store loss history
+        self.loss_history = []
 
     def forward(self, X):
-        """
-        Forward pass. Supports batch input of shape (batch_size, input_size)
-        """
-        self.a1 = np.dot(X, self.W1) + self.b1         # (batch_size, hidden_size)
-        self.z1 = np.tanh(self.a1)                       # activation of hidden layer
-        self.a2 = np.dot(self.z1, self.W2) + self.b2     # (batch_size, output_size)
-        self.output = softmax(self.a2)                   # apply softmax for classification
+        self.a1 = np.dot(X, self.W1) + self.b1
+        self.z1 = np.tanh(self.a1)
+        self.a2 = np.dot(self.z1, self.W2) + self.b2
+        self.output = softmax(self.a2)
         return self.output
 
     def backward_batch(self, X, y, output):
-        """
-        Backward pass for a batch of samples using cross-entropy loss.
-        """
         batch_size = X.shape[0]
-        # For cross-entropy with softmax, the gradient of the loss w.r.t. a2 is (output - target)
-        dloss_da2 = (output - y) / batch_size  # shape: (batch_size, output_size)
-        
-        # Gradients for W2 and b2
+        dloss_da2 = (output - y) / batch_size
         dloss_dW2 = np.dot(self.z1.T, dloss_da2)
         dloss_db2 = np.sum(dloss_da2, axis=0, keepdims=True)
-        
-        # Backpropagate through tanh in layer 1.
+
         dloss_dz1 = np.dot(dloss_da2, self.W2.T)
-        dloss_da1 = dloss_dz1 * (1 - np.tanh(self.a1) ** 2)
+        dloss_da1 = dloss_dz1 * (1 - self.z1 ** 2)
         dloss_dW1 = np.dot(X.T, dloss_da1)
         dloss_db1 = np.sum(dloss_da1, axis=0, keepdims=True)
-        
-        # Gradient clipping (optional)
-        max_grad_value = 1.0
-        dloss_dW1 = np.clip(dloss_dW1, -max_grad_value, max_grad_value)
-        dloss_db1 = np.clip(dloss_db1, -max_grad_value, max_grad_value)
-        dloss_dW2 = np.clip(dloss_dW2, -max_grad_value, max_grad_value)
-        dloss_db2 = np.clip(dloss_db2, -max_grad_value, max_grad_value)
-        
-        # Update weights using gradient descent
-        learning_rate = 0.0001
-        self.W1 -= learning_rate * dloss_dW1
-        self.b1 -= learning_rate * dloss_db1
-        self.W2 -= learning_rate * dloss_dW2
-        self.b2 -= learning_rate * dloss_db2
-        
-        # Update learning space using the average adjustment from the batch
-        self.update_learning_space_batch(X, dloss_da2)
 
-    def update_learning_space_batch(self, X, dloss_da2):
-        """
-        Update the learning space based on the hidden layer activity and error from a batch.
-        Computes an adjustment of shape (hidden_size, output_size) and then tiles it
-        to double the dimensions.
-        
-        After the update, a soft radial (Gaussian) blur is applied so that
-        neighboring perceptrons share data.
-        """
-        perceptron_activity_avg = np.mean(self.z1, axis=0, keepdims=True)  # (1, hidden_size)
-        error_significance_avg = np.mean(np.abs(dloss_da2), axis=0, keepdims=True)  # (1, output_size)
+        for grad in (dloss_dW1, dloss_db1, dloss_dW2, dloss_db2):
+            np.clip(grad, -self.max_grad_value, self.max_grad_value, out=grad)
+
+        self.W1 -= self.learning_rate * dloss_dW1
+        self.b1 -= self.learning_rate * dloss_db1
+        self.W2 -= self.learning_rate * dloss_dW2
+        self.b2 -= self.learning_rate * dloss_db2
+
+        self.update_learning_space_batch(dloss_da2)
+
+    def update_learning_space_batch(self, dloss_da2):
+        perceptron_activity_avg = np.mean(self.z1, axis=0, keepdims=True)
+        error_significance_avg = np.mean(np.abs(dloss_da2), axis=0, keepdims=True)
         adjustment = np.dot(perceptron_activity_avg.T, error_significance_avg) * 0.01
-        doubled_adjustment = np.kron(adjustment, np.ones((2, 2)))
-        
-        # Update the learning space
+        doubled_adjustment = np.kron(adjustment, self._kron_tile)
         self.learning_space += doubled_adjustment
-        
-        # Apply a soft radial (Gaussian) blur to the learning space.
-        # Adjust sigma as needed for the desired "softness".
-        self.learning_space = gaussian_filter(self.learning_space, sigma=1)
+        self.learning_space = gaussian_filter(self.learning_space, sigma=self.blur_sigma)
 
     def visualize_learning_space(self):
-        # DO NOT TOUCH THIS VISUALISER!!!
         plt.imshow(self.learning_space, cmap=self.colormap, interpolation='nearest')
-        plt.title("Learning Space Visualization")
+        plt.title("Liquid Data Matrix Learning Space")
         plt.colorbar()
+        plt.show()
+
+    def plot_loss(self):
+        plt.plot(self.loss_history)
+        plt.xlabel("Epochs")
+        plt.ylabel("Loss")
+        plt.title("Training Loss Over Time")
+        plt.grid(True)
         plt.show()
 
     def train(self, samples, epochs=500000, batch_size=32, vis_interval=1000):
         num_samples = len(samples)
         for epoch in tqdm(range(epochs), desc="Training Epochs"):
             batch_indices = np.random.choice(num_samples, batch_size, replace=False)
-            X_batch_list = []
-            y_batch_list = []
-            details_batch = []  # for logging
-            
-            for idx in batch_indices:
-                X_sample, task, label = samples[idx]
-                # For arithmetic tasks, pad to length 3 if needed.
-                if X_sample.shape[0] == 2:
-                    X_sample = np.append(X_sample, 0)
-                X_batch_list.append(X_sample)
-                y_batch_list.append(label)
-                
-                # Create a problem detail string for logging.
-                if task == "algebra":
-                    a, b, c = X_sample
-                    result = (c - b) // a
-                    details_batch.append(f"{a}x + {b} = {c}, x = {result}")
-                elif task == "addition":
-                    result = X_sample[0] + X_sample[1]
-                    details_batch.append(f"{X_sample[0]} + {X_sample[1]} = {result}")
-                elif task == "subtraction":
-                    result = X_sample[0] - X_sample[1]
-                    details_batch.append(f"{X_sample[0]} - {X_sample[1]} = {result}")
-                elif task == "multiplication":
-                    result = X_sample[0] * X_sample[1]
-                    details_batch.append(f"{X_sample[0]} * {X_sample[1]} = {result}")
-                elif task == "division":
-                    result = X_sample[0] // X_sample[1]
-                    details_batch.append(f"{X_sample[0]} / {X_sample[1]} = {result}")
-                elif task == "exponentiation":
-                    result = X_sample[0] ** X_sample[1]
-                    details_batch.append(f"{X_sample[0]}^{X_sample[1]} = {result}")
-                elif task == "chain":
-                    a, b, c = X_sample
-                    intermediate = a + b
-                    result = intermediate * c
-                    details_batch.append(f"({a} + {b}) * {c} = {result}")
-                else:
-                    details_batch.append("Unknown task")
-            
-            X_batch = np.array(X_batch_list)
-            y_batch = np.array(y_batch_list)
-            
-            # Forward pass
+            X_batch = np.array([samples[i][0] for i in batch_indices])
+            y_batch = np.array([samples[i][2] for i in batch_indices])
+
             predictions = self.forward(X_batch)
-            # Compute cross-entropy loss for logging purposes
             loss = cross_entropy_loss(predictions, y_batch)
-            
-            # Backward pass
+            self.loss_history.append(loss)
             self.backward_batch(X_batch, y_batch, predictions)
-            
+
             if epoch % vis_interval == 0:
-                print(f"\nEpoch {epoch}/{epochs}, Batch Cross-Entropy Loss: {loss}")
-                print("Example batch problem:", details_batch[0])
+                print(f"\nEpoch {epoch}/{epochs} | Loss: {loss:.6f}")
+                print("Example Problem:", samples[batch_indices[0]][1])
                 self.visualize_learning_space()
 
-# -----------------------------
-# One-Hot Encoding Utility
-# -----------------------------
-def create_one_hot_encoding(result, max_value):
-    one_hot = np.zeros(max_value)
-    if 1 <= result <= max_value:
-        one_hot[result - 1] = 1
-    else:
-        raise ValueError(f"Result {result} out of bounds for one-hot encoding with size {max_value}")
-    return one_hot
+        # Show loss graph after training
+        self.plot_loss()
+
 
 # -----------------------------
 # Dataset Generator
 # -----------------------------
 def generate_math_dataset(num_samples_per_task=1000, min_val=1, max_val=10, output_size=150):
-    """
-    Generate a list of samples for several tasks:
-      - Addition, Subtraction, Multiplication, Division, Algebra, Exponentiation, and Chain.
-    """
     samples = []
-    
-    # Addition: result = a + b
+    rng = np.random.default_rng()
+
     for _ in range(num_samples_per_task):
-        a = np.random.randint(min_val, max_val+1)
-        b = np.random.randint(min_val, max_val+1)
-        result = a + b
-        label = create_one_hot_encoding(result, max_value=output_size)
-        samples.append((np.array([a, b, 0]), "addition", label))
-        
-    # Subtraction: ensure a >= b (shift result by +1)
+        a, b = rng.integers(min_val, max_val+1, size=2)
+        samples.append(([a, b, 0], f"{a} + {b}", create_one_hot_encoding(a+b, output_size)))
+
     for _ in range(num_samples_per_task):
-        a = np.random.randint(min_val, max_val+1)
-        b = np.random.randint(min_val, a+1)
-        result = a - b
-        label = create_one_hot_encoding(result + 1, max_value=output_size)
-        samples.append((np.array([a, b, 0]), "subtraction", label))
-        
-    # Multiplication: result = a * b
+        a = rng.integers(min_val, max_val+1)
+        b = rng.integers(min_val, a+1)
+        samples.append(([a, b, 0], f"{a} - {b}", create_one_hot_encoding(a-b+1, output_size)))
+
     for _ in range(num_samples_per_task):
-        a = np.random.randint(min_val, max_val+1)
-        b = np.random.randint(min_val, max_val+1)
-        result = a * b
-        label = create_one_hot_encoding(result, max_value=output_size)
-        samples.append((np.array([a, b, 0]), "multiplication", label))
-        
-    # Division: generate pairs where a is divisible by b.
+        a, b = rng.integers(min_val, max_val+1, size=2)
+        samples.append(([a, b, 0], f"{a} × {b}", create_one_hot_encoding(a*b, output_size)))
+
     for _ in range(num_samples_per_task):
-        b = np.random.randint(min_val, max_val+1)
-        multiplier = np.random.randint(1, max_val+1)
-        a = b * multiplier
-        result = a // b
-        label = create_one_hot_encoding(result, max_value=output_size)
-        samples.append((np.array([a, b, 0]), "division", label))
-        
-    # Algebra: a*x + b = c -> solve for x.
+        b = rng.integers(min_val, max_val+1)
+        a = b * rng.integers(1, max_val+1)
+        samples.append(([a, b, 0], f"{a} ÷ {b}", create_one_hot_encoding(a//b, output_size)))
+
     for _ in range(num_samples_per_task):
-        a = np.random.randint(min_val, max_val+1)
-        x = np.random.randint(min_val, max_val+1)
-        b = np.random.randint(-max_val, max_val+1)
+        a = rng.integers(min_val, max_val+1)
+        x = rng.integers(min_val, max_val+1)
+        b = rng.integers(-max_val, max_val+1)
         c = a * x + b
-        label = create_one_hot_encoding(x, max_value=output_size)
-        samples.append((np.array([a, b, c]), "algebra", label))
-        
-    # Exponentiation: result = a^b.
+        samples.append(([a, b, c], f"Solve {a}x + {b} = {c}", create_one_hot_encoding(x, output_size)))
+
     for _ in range(num_samples_per_task):
-        a = np.random.randint(1, 6)
-        b = np.random.randint(0, 4)
-        result = a ** b
-        label = create_one_hot_encoding(result, max_value=output_size)
-        samples.append((np.array([a, b, 0]), "exponentiation", label))
-        
-    # Chain: (a + b) * c.
+        a = rng.integers(1, 6)
+        b = rng.integers(0, 4)
+        samples.append(([a, b, 0], f"{a}^{b}", create_one_hot_encoding(a**b, output_size)))
+
     for _ in range(num_samples_per_task):
-        a = np.random.randint(min_val, max_val+1)
-        b = np.random.randint(min_val, max_val+1)
-        c = np.random.randint(min_val, 6)  # restrict c so result stays in bounds.
-        intermediate = a + b
-        result = intermediate * c
-        label = create_one_hot_encoding(result, max_value=output_size)
-        samples.append((np.array([a, b, c]), "chain", label))
-    
+        a, b = rng.integers(min_val, max_val+1, size=2)
+        c = rng.integers(min_val, 6)
+        samples.append(([a, b, c], f"({a} + {b}) × {c}", create_one_hot_encoding((a+b)*c, output_size)))
+
     return samples
 
+
 # -----------------------------
-# Main Section: Initialize and Train
+# Main
 # -----------------------------
 if __name__ == "__main__":
-    input_size = 3
-    hidden_size = 64
-    output_size = 150  # must cover the maximum output result from any task
-    colormap = "viridis"
-    
-    nn = NeuralNetwork(input_size, hidden_size, output_size, colormap=colormap)
-    samples = generate_math_dataset(num_samples_per_task=1000, min_val=1, max_val=10, output_size=output_size)
-    
-    # Adjust epochs, batch_size, and visualization interval as needed.
-    nn.train(samples, epochs=50000, batch_size=1, vis_interval=10000)
-
+    ldm = LiquidDataMatrix(input_size=3, hidden_size=64, output_size=150)
+    dataset = generate_math_dataset(num_samples_per_task=1000, min_val=1, max_val=10, output_size=150)
+    ldm.train(dataset, epochs=50000, batch_size=1, vis_interval=10000)
