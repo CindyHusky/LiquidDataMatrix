@@ -1,25 +1,43 @@
 """
 LDM_Project_POC.py
 
-Usage examples:
-- Realtime with CUDA and adaptation (default is adapt on):
-  `python LDM_Project_POC.py --realtime --device 1 --cuda --scale 16 --adapt`
-- Realtime with full online training:
-  `python LDM_Project_POC.py --realtime --device 1 --train --cuda --scale 16`
-- Offline demo (synthetic, larger):
-  `python LDM_Project_POC.py --demo --scale 16 --cuda`
+Lightweight prototype for transforming webcam frames into a compact pixel representation
+and reconstructing them in real time. Intended as a proof-of-concept for a small research
+project — optimized for clarity and ease of use, and packaged for GitHub.
 
-Dependencies:
+Features
+- Real-time webcam / OBS virtual camera input
+- PyTorch implementation with optional CUDA acceleration
+- Display: original frame | pixel-vector visualization | reconstructed image
+- Online and lightweight per-frame adaptation modes
+
+Requirements
+- Python 3.8+
 - numpy, opencv-python, matplotlib (optional), torch
 
-Note: This prototype focuses on responsiveness and clarity, not peak GPU throughput. If you want further speed-ups I can change model architecture (conv layers, grouped matmuls) or reduce parameter count in key places.
+Install
+```
+pip install numpy opencv-python matplotlib torch
+```
+
+Quick start
+- Realtime (default device):
+  `python LDM_Project_POC.py --realtime`
+- Realtime (specific device):
+  `python LDM_Project_POC.py --realtime --device 1`
+- Realtime with CUDA (if available):
+  `python LDM_Project_POC.py --realtime --device 1 --cuda`
+- Run synthetic demo:
+  `python LDM_Project_POC.py --demo`
+
+License: MIT
 """
 
 import argparse
 import os
-import pickle
 import math
 import time
+import pickle
 
 import numpy as np
 import cv2
@@ -30,20 +48,17 @@ import torch.nn as nn
 import torch.optim as optim
 
 
-# ------------------------- Helpers -------------------------
+# -------- Helpers --------
 
 def choose_device(use_cuda: bool):
-    if use_cuda and torch.cuda.is_available():
-        return torch.device('cuda')
-    return torch.device('cpu')
+    return torch.device('cuda') if (use_cuda and torch.cuda.is_available()) else torch.device('cpu')
 
 
-# ------------------------- Pixel Vector Mapper -------------------------
+# -------- Pixel mapper --------
 class PixelVector:
     def __init__(self, vector_size, img_shape=None):
         self.vector_size = vector_size
         if img_shape is None:
-            # prefer width 128 when divisible, else sqrt shape
             for pref in (128, 64, 32):
                 if vector_size % pref == 0:
                     w = pref
@@ -59,28 +74,26 @@ class PixelVector:
         assert self.img_shape[0] * self.img_shape[1] == vector_size, "img shape must match vector size"
 
     def to_image(self, vec):
-        v = vec.reshape(self.img_shape)
-        return v
+        return vec.reshape(self.img_shape)
 
 
-# ------------------------- Novelty Detector & Memory Bank -------------------------
+# -------- Memory (simple store) --------
 class MemoryBank:
-    def __init__(self, capacity=8192, prototype_dim=8192, novelty_threshold=0.72, device=torch.device('cpu')):
+    def __init__(self, capacity=8192, prototype_dim=8192, threshold=0.72, device=torch.device('cpu')):
         self.capacity = capacity
         self.prototype_dim = prototype_dim
-        self.novelty_threshold = novelty_threshold
+        self.threshold = threshold
         self.device = device
         self.prototypes = torch.empty((0, prototype_dim), device=self.device)
 
-    def is_novel(self, vec: torch.Tensor):
+    def is_new(self, vec: torch.Tensor):
         if self.prototypes.shape[0] == 0:
             return True, None
         v = vec / (vec.norm() + 1e-8)
         P = self.prototypes / (self.prototypes.norm(dim=1, keepdim=True) + 1e-8)
         sims = P.matmul(v)
         best, idx = torch.max(sims, dim=0)
-        novel = (best.item() < self.novelty_threshold)
-        return novel, int(idx.item())
+        return (best.item() < self.threshold), int(idx.item())
 
     def store(self, vec: torch.Tensor):
         vec = vec.reshape(1, -1).to(self.device)
@@ -91,28 +104,14 @@ class MemoryBank:
             self.prototypes[i] = vec
 
 
-# ------------------------- PyTorch LDM Model -------------------------
+# -------- Model --------
 class LDMModel(nn.Module):
-    def __init__(self, input_dim, encoder_hidden, pixel_vector_size, infer_hidden):
+    def __init__(self, input_dim, enc_hidden, pixel_size, inf_hidden):
         super().__init__()
-        # simple fully-connected stacks; LeakyReLU avoids saturation and speeds dynamics
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, encoder_hidden),
-            nn.LeakyReLU(0.1)
-        )
-        self.to_pixel = nn.Sequential(
-            nn.Linear(encoder_hidden, pixel_vector_size),
-            nn.Sigmoid()  # keep pixel vector in [0,1]
-        )
-        self.infer1 = nn.Sequential(
-            nn.Linear(pixel_vector_size, infer_hidden),
-            nn.LeakyReLU(0.1)
-        )
-        self.infer2 = nn.Sequential(
-            nn.Linear(infer_hidden, input_dim),
-            nn.Sigmoid()
-        )
-        # init weights
+        self.encoder = nn.Sequential(nn.Linear(input_dim, enc_hidden), nn.LeakyReLU(0.1))
+        self.to_pixel = nn.Sequential(nn.Linear(enc_hidden, pixel_size), nn.Sigmoid())
+        self.infer1 = nn.Sequential(nn.Linear(pixel_size, inf_hidden), nn.LeakyReLU(0.1))
+        self.infer2 = nn.Sequential(nn.Linear(inf_hidden, input_dim), nn.Sigmoid())
         self._init_weights()
 
     def _init_weights(self):
@@ -138,44 +137,22 @@ class LDMModel(nn.Module):
         return out, p
 
 
-# ------------------------- LDM System (wrapper) -------------------------
+# -------- System wrapper --------
 class LDMSystem:
-    def __init__(self,
-                 scale=16,
-                 base_input_dim=64,
-                 base_encoder_hidden=128,
-                 base_pixel_vector=256,
-                 base_infer_hidden=128,
-                 lr=5e-4,
-                 novelty_lr_factor=8.0,
-                 novelty_threshold=0.72,
-                 device=torch.device('cpu')):
-        # scale sizes
+    def __init__(self, scale=16, base_input=64, base_enc=128, base_pixel=256, base_inf=128, lr=5e-4, device=torch.device('cpu')):
         self.scale = scale
-        self.input_dim = base_input_dim * scale
-        self.encoder_hidden = base_encoder_hidden * scale
-        self.pixel_vector_size = base_pixel_vector * scale
-        self.infer_hidden = base_infer_hidden * scale
-
+        self.input_dim = base_input * scale
+        self.enc_hidden = base_enc * scale
+        self.pixel_size = base_pixel * scale
+        self.inf_hidden = base_inf * scale
         self.device = device
 
-        # model
-        self.model = LDMModel(self.input_dim, self.encoder_hidden, self.pixel_vector_size, self.infer_hidden).to(self.device)
+        self.model = LDMModel(self.input_dim, self.enc_hidden, self.pixel_size, self.inf_hidden).to(self.device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
 
-        # optimizers (Adam for faster adaptation)
-        self.lr = lr
-        self.novelty_lr_factor = novelty_lr_factor
-        self.main_optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
-        enc_params = list(self.model.encoder.parameters()) + list(self.model.to_pixel.parameters())
-        self.novelty_optimizer = optim.Adam(enc_params, lr=self.lr * self.novelty_lr_factor)
+        self.memory = MemoryBank(capacity=8192, prototype_dim=self.pixel_size, threshold=0.72)
+        self.pixel_mapper = PixelVector(self.pixel_size)
 
-        # memory bank
-        self.memory = MemoryBank(capacity=8192, prototype_dim=self.pixel_vector_size, novelty_threshold=novelty_threshold, device=torch.device('cpu'))
-
-        # pixel display mapper
-        self.pixel_mapper = PixelVector(self.pixel_vector_size)
-
-        # input image shape
         if self.input_dim % 128 == 0:
             self.src_hw = (self.input_dim // 128, 128)
         elif self.input_dim % 64 == 0:
@@ -185,13 +162,11 @@ class LDMSystem:
             self.src_hw = (s, (self.input_dim + s - 1) // s)
 
         self.loss_fn = nn.MSELoss()
-
-        # running input normalization
         self.running_mean = 0.0
         self.running_var = 1.0
         self.running_count = 0
 
-    def update_running_stats(self, x_np):
+    def _update_stats(self, x_np):
         x = x_np.reshape(-1)
         self.running_count += 1
         if self.running_count == 1:
@@ -203,45 +178,34 @@ class LDMSystem:
             self.running_var = ((self.running_count - 2) / (self.running_count - 1)) * self.running_var + (x - old_mean) * (x - new_mean)
             self.running_mean = new_mean
 
-    def normalize_input(self, x_np):
-        # small epsilon for stability
+    def _normalize(self, x_np):
         if self.running_count < 2:
             return x_np
         std = np.sqrt(self.running_var / (self.running_count - 1) + 1e-6)
         normed = (x_np.reshape(-1) - self.running_mean) / std
-        # scale into [0,1]
         normed = (normed - normed.min()) / (normed.max() - normed.min() + 1e-9)
         return normed.reshape(-1, 1)
 
     def train_step(self, x_np):
-        # update running stats for stable learning
-        self.update_running_stats(x_np)
-        x_norm = self.normalize_input(x_np)
-
-        x = torch.tensor(x_norm.T, dtype=torch.float32, device=self.device)  # (1, input_dim)
-        self.main_optimizer.zero_grad()
+        self._update_stats(x_np)
+        x_norm = self._normalize(x_np)
+        x = torch.tensor(x_norm.T, dtype=torch.float32, device=self.device)
+        self.optimizer.zero_grad()
         out, p = self.model(x)
         loss = self.loss_fn(out, x)
         loss.backward()
-        self.main_optimizer.step()
+        self.optimizer.step()
 
         p_flat = p.detach().cpu().reshape(-1)
-        novel, idx = self.memory.is_novel(p_flat)
-        if novel:
-            self.novelty_optimizer.zero_grad()
-            out2, p2 = self.model(x)
-            loss2 = self.loss_fn(out2, x)
-            loss2.backward()
-            self.novelty_optimizer.step()
-            self.memory.store(p2.detach().cpu().reshape(-1))
+        is_new, idx = self.memory.is_new(p_flat)
+        if is_new:
+            self.memory.store(p_flat)
 
-        return loss.item(), novel
+        return loss.item(), is_new
 
     def adapt_step(self, x_np, adapt_lr=1e-4):
-        # very small per-frame adaptation regardless of full train flag — keeps visuals moving
-        x_norm = self.normalize_input(x_np)
+        x_norm = self._normalize(x_np)
         x = torch.tensor(x_norm.T, dtype=torch.float32, device=self.device)
-        # create a tiny optimizer that only updates encoder+to_pixel briefly
         enc_params = list(self.model.encoder.parameters()) + list(self.model.to_pixel.parameters())
         adapt_opt = optim.Adam(enc_params, lr=adapt_lr)
         adapt_opt.zero_grad()
@@ -252,19 +216,15 @@ class LDMSystem:
         return loss.item()
 
     def infer_only(self, x_np):
-        x_norm = self.normalize_input(x_np)
+        x_norm = self._normalize(x_np)
         x = torch.tensor(x_norm.T, dtype=torch.float32, device=self.device)
         with torch.no_grad():
             out, p = self.model(x)
-        out_np = out.detach().cpu().numpy().reshape(-1)
-        p_np = p.detach().cpu().numpy().reshape(-1)
-        return out_np, p_np
+        return out.detach().cpu().numpy().reshape(-1), p.detach().cpu().numpy().reshape(-1)
 
     def pixel_to_display(self, p_vec, upsample=512):
-        # Try to build a 3-channel image from pixel vector for richer visuals
         vec = p_vec.reshape(-1)
         L = vec.size
-        # if divisible by 3, split into channels
         if L % 3 == 0:
             c = L // 3
             r = vec[0:c].reshape(self.pixel_mapper.img_shape)
@@ -287,14 +247,7 @@ class LDMSystem:
         return cv2.cvtColor(img_u, cv2.COLOR_GRAY2BGR)
 
     def save_checkpoint(self, path="ldm_pytorch_checkpoint.pt"):
-        state = {
-            'model': self.model.state_dict(),
-            'optimizer': self.main_optimizer.state_dict(),
-            'memory': self.memory.prototypes.numpy(),
-            'running_mean': self.running_mean,
-            'running_var': self.running_var,
-            'running_count': self.running_count
-        }
+        state = {'model': self.model.state_dict(), 'optimizer': self.optimizer.state_dict(), 'memory': self.memory.prototypes.numpy(), 'running_mean': self.running_mean, 'running_var': self.running_var, 'running_count': self.running_count}
         torch.save(state, path)
 
     def load_checkpoint(self, path="ldm_pytorch_checkpoint.pt"):
@@ -303,7 +256,7 @@ class LDMSystem:
         state = torch.load(path, map_location=self.device)
         self.model.load_state_dict(state['model'])
         try:
-            self.main_optimizer.load_state_dict(state['optimizer'])
+            self.optimizer.load_state_dict(state['optimizer'])
         except Exception:
             pass
         self.memory.prototypes = torch.tensor(state.get('memory', np.zeros((0, self.memory.prototype_dim))), dtype=torch.float32)
@@ -313,7 +266,7 @@ class LDMSystem:
         return True
 
 
-# ------------------------- Utils: frame -> input vector -------------------------
+# -------- Frame -> vector --------
 
 def frame_to_input_vector(frame_gray, input_dim, src_hw):
     small = cv2.resize(frame_gray, (src_hw[1], src_hw[0]), interpolation=cv2.INTER_AREA)
@@ -327,7 +280,7 @@ def frame_to_input_vector(frame_gray, input_dim, src_hw):
     return vec.reshape(-1, 1)
 
 
-# ------------------------- Demo (synthetic) -------------------------
+# -------- Demo --------
 
 def synthetic_input_patterns(n_patterns=32, input_dim=4096, noise=0.04):
     bases = []
@@ -377,12 +330,11 @@ def run_demo(steps=400, show_every=100, scale=16, use_cuda=False):
     print('Demo complete. Checkpoint saved to ldm_pytorch_checkpoint.pt')
 
 
-# ------------------------- Real-time OBS/webcam mode (PyTorch) -------------------------
+# -------- Realtime --------
 
 def run_realtime(device=0, train=False, scale=16, use_cuda=False, cam_backend=None, adapt=True):
     device_t = choose_device(use_cuda)
 
-    # robust VideoCapture
     cap = None
     try:
         if cam_backend == 'dshow' and hasattr(cv2, 'CAP_DSHOW'):
@@ -415,7 +367,6 @@ def run_realtime(device=0, train=False, scale=16, use_cuda=False, cam_backend=No
             if train:
                 loss, novel = sys.train_step(inp)
             else:
-                # small per-frame adaptation keeps things moving without full training
                 if adapt:
                     loss = sys.adapt_step(inp, adapt_lr=2e-4)
                     novel = False
@@ -425,7 +376,6 @@ def run_realtime(device=0, train=False, scale=16, use_cuda=False, cam_backend=No
 
             out_np, p_np = sys.infer_only(inp)
 
-            # displays
             orig_display = cv2.resize(frame, (480, 360))
             pixel_display = sys.pixel_to_display(p_np, upsample=360)
             recon_display = sys.recon_to_display(out_np, upsample=360)
@@ -462,7 +412,6 @@ if __name__ == '__main__':
         else:
             if not args.realtime:
                 print('No mode selected. Defaulting to realtime mode. Use --demo for offline demo.')
-            # default adapt True unless explicitly disabled by lack of flag
             adapt_flag = args.adapt or True
             run_realtime(device=args.device, train=args.train, scale=args.scale, use_cuda=args.cuda, cam_backend=args.backend, adapt=adapt_flag)
     except RuntimeError as e:
