@@ -1,15 +1,6 @@
 """
 LDM_Project_POC.py
 
-Improved realtime LDM prototype — larger, more responsive, CUDA-ready.
-Changes since last version:
-- Default scale increased (now 16) to make the model much larger.
-- Switched to PyTorch Adam optimizers and LeakyReLU activations for faster, non-saturating learning.
-- Added lightweight per-frame adaptation mode (`--adapt`) that makes the model update a tiny amount each frame to avoid visual stagnation even when full online training is off.
-- Improved input normalization (running mean/std) for stability.
-- Color pixel visualization: maps the pixel vector into 3 channels when possible (r,g,b) to give richer, larger displays.
-- Larger upsample sizes for display.
-
 Usage examples:
 - Realtime with CUDA and adaptation (default is adapt on):
   `python LDM_Project_POC.py --realtime --device 1 --cuda --scale 16 --adapt`
