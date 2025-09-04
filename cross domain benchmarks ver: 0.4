@@ -1,0 +1,625 @@
+# cross domain bench ver 0.4
+import json
+import math
+import os
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+import traceback
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from PySide6 import QtCore, QtWidgets
+
+# Device: prefer CUDA when available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# -------------------------
+# Utilities
+# -------------------------
+
+def now():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def prepare_save_directory(path: Path) -> Path:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        raise IOError(f"Failed to create directory '{path}': {e}") from e
+    try:
+        test_file = path / ".write_test"
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write("ok")
+        test_file.unlink()
+    except Exception as e:
+        raise IOError(f"Permission denied or not writable: '{path}': {e}") from e
+    return path
+
+
+# -------------------------
+# LDM and MLP implemented with PyTorch
+# -------------------------
+class LiquidDataMatrix:
+    def __init__(self, latent_size: int, dtype=torch.float32, init_scale: float = 0.01):
+        self.latent_size = latent_size
+        self.dtype = dtype
+        self.init_scale = init_scale
+        self.S = (torch.randn(latent_size, dtype=dtype, device=device) * init_scale).detach()
+        self.write_proj = None
+
+    def get_batched(self, batch_size: int) -> torch.Tensor:
+        return self.S.unsqueeze(0).expand(batch_size, -1).clone()
+
+    def update_ema(self, write_vector: torch.Tensor, alpha: float):
+        w = write_vector.mean(dim=0) if write_vector.dim() == 2 else write_vector
+        D = w.shape[0]
+        if D != self.latent_size:
+            if self.write_proj is None:
+                rng = torch.Generator(device='cpu')
+                rng.manual_seed(12345)
+                proj = torch.randn(D, self.latent_size, dtype=self.dtype, generator=rng).to(device) * self.init_scale
+                self.write_proj = proj
+            w = w @ self.write_proj
+        w = w.to(self.dtype).to(device)
+        self.S = (alpha * self.S + (1.0 - alpha) * w).detach()
+
+
+class SimpleMLP(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, lr: float = 1e-3, seed: int = 42):
+        super().__init__()
+        torch.manual_seed(seed)
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.relu = nn.ReLU()
+        self.to(device)
+        self.opt = optim.Adam(self.parameters(), lr=lr)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        z1 = self.fc1(x)
+        h = self.relu(z1)
+        logits = self.fc2(h)
+        return logits, h
+
+    def step(self):
+        self.opt.step()
+
+
+# -------------------------
+# Data generators (return torch tensors on device)
+# -------------------------
+
+def gen_boolean_dataset(batch_size=64):
+    X = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=torch.float32, device=device)
+    y_xor = torch.tensor([0, 1, 1, 0], dtype=torch.float32, device=device)
+    reps = int(math.ceil(batch_size / X.shape[0]))
+    Xb = X.repeat(reps, 1)[:batch_size]
+    y = y_xor.repeat(reps)[:batch_size].unsqueeze(1)
+    return Xb, y
+
+
+def gen_arithmetic_dataset(batch_size=128):
+    xs = (torch.empty(batch_size, 1).uniform_(-3.0, 3.0)).to(device)
+    sinx = torch.sin(xs)
+    expx = torch.exp(xs / 3.0)
+    cosx = torch.cos(xs)
+    mod5 = (xs % 5.0)
+    return xs, torch.cat([sinx, expx, cosx, mod5], dim=1)
+
+
+def gen_sequence_dataset(batch_size=64, seq_type="fibonacci", min_len=3, max_len=8, normalize=True, max_len_param=12):
+    seqs, targets = [], []
+    for _ in range(batch_size):
+        L = np.random.randint(min_len, max_len + 1)
+        if seq_type == "fibonacci":
+            s = [1, 1]
+            while len(s) < L + 1:
+                s.append(s[-1] + s[-2])
+            seq, targ = s[:L], s[L]
+        else:
+            a = np.random.uniform(-2, 2)
+            b = np.random.uniform(-1, 1)
+            seq = [a * i + b for i in range(L)]
+            targ = a * L + b
+        arr = torch.tensor(seq, dtype=torch.float32, device=device).reshape(-1, 1)
+        seqs.append(arr)
+        targets.append(torch.tensor([targ], dtype=torch.float32, device=device))
+    targets = torch.stack(targets, dim=0)
+    return seqs, targets
+
+
+def gen_spatial_dataset(batch_size=64, img_size=8):
+    imgs = []
+    labels = []
+    for _ in range(batch_size):
+        im = torch.zeros(img_size, img_size, dtype=torch.float32, device=device)
+        choice = np.random.choice(["vertical", "horizontal", "centered_blob", "diagonal"])
+        if choice == "vertical":
+            col = np.random.randint(0, img_size)
+            im[:, col] = 1.0
+            labels.append(0)
+        elif choice == "horizontal":
+            row = np.random.randint(0, img_size)
+            im[row, :] = 1.0
+            labels.append(1)
+        elif choice == "centered_blob":
+            cx, cy = img_size // 2, img_size // 2
+            im[cx - 1:cx + 2, cy - 1:cy + 2] = 1.0
+            labels.append(2)
+        else:
+            for i in range(img_size):
+                im[i, i] = 1.0
+            labels.append(3)
+        imgs.append(im.reshape(-1))
+    xs = torch.stack(imgs, dim=0)
+    ys = torch.tensor(labels, dtype=torch.long, device=device)
+    return xs, ys
+
+
+def gen_temporal_dataset(batch_size=64, min_len=20, max_len=40):
+    seqs, targets = [], []
+    for _ in range(batch_size):
+        L = np.random.randint(min_len, max_len + 1)
+        t = np.linspace(0, 2 * math.pi * np.random.uniform(0.5, 3.0), L)
+        seq = torch.from_numpy(np.sin(t) + 0.1 * np.random.randn(L)).float().reshape(-1, 1).to(device)
+        seqs.append(seq)
+        targets.append(torch.tensor([0.0], dtype=torch.float32, device=device))
+    return seqs, torch.stack(targets, dim=0)
+
+
+def pad_and_flatten(seqs: List[torch.Tensor], max_len: int) -> torch.Tensor:
+    batch_size = len(seqs)
+    feat_dim = seqs[0].shape[1]
+    out = torch.zeros((batch_size, max_len, feat_dim), dtype=torch.float32, device=device)
+    for i, s in enumerate(seqs):
+        L = min(s.shape[0], max_len)
+        out[i, :L, :] = s[:L, :]
+    return out.reshape(batch_size, -1)
+
+
+DATA_GENERATORS = {
+    "boolean": {"func": gen_boolean_dataset, "task_type": "classification_binary", "is_sequence": False},
+    "arithmetic": {"func": gen_arithmetic_dataset, "task_type": "regression", "is_sequence": False},
+    "sequence": {"func": gen_sequence_dataset, "task_type": "regression", "is_sequence": True, "max_len_key": "max_seq_len"},
+    "spatial": {"func": gen_spatial_dataset, "task_type": "classification_multiclass", "is_sequence": False},
+    "temporal": {"func": gen_temporal_dataset, "task_type": "regression", "is_sequence": True, "max_len_key": "temporal_max_len"}
+}
+
+
+# -------------------------
+# Training / benchmarking (PyTorch)
+# -------------------------
+
+def train_category(name: str, mlp: SimpleMLP, ldm: LiquidDataMatrix, epochs: int, batch_size: int, alpha_s: float, log_every: int, dataset_kwargs: Dict[str, Any], cfg: Dict[str, Any], emit, stop_event: threading.Event, progress_update_fn=None):
+    logs = []
+    generator_info = DATA_GENERATORS.get(name)
+    if not generator_info:
+        raise ValueError(f"Unknown category: {name}")
+    data_func = generator_info["func"]
+    task_type = generator_info["task_type"]
+    is_sequence = generator_info["is_sequence"]
+
+    if task_type == "classification_binary":
+        criterion = nn.BCEWithLogitsLoss()
+    elif task_type == "classification_multiclass":
+        criterion = nn.CrossEntropyLoss()
+    elif task_type == "regression":
+        criterion = nn.MSELoss()
+    else:
+        raise ValueError(f"Unknown task_type: {task_type}")
+
+    for epoch in range(1, epochs + 1):
+        if stop_event.is_set():
+            emit(f"{name}: stop requested, breaking at epoch {epoch}.")
+            break
+        if is_sequence:
+            max_len_key = generator_info.get("max_len_key", "max_seq_len")
+            max_len = dataset_kwargs.get("max_len", cfg.get(max_len_key, cfg.get("max_seq_len", 12)))
+            seqs, y = data_func(batch_size=batch_size, max_len=max_len)
+            input_batch = pad_and_flatten(seqs, max_len=max_len)
+        else:
+            input_batch, y = data_func(batch_size=batch_size)
+
+        latent_batched = ldm.get_batched(batch_size=input_batch.shape[0])
+        X_with_S = torch.cat([input_batch.to(device), latent_batched.to(device)], dim=1).to(device)
+
+        mlp.opt.zero_grad()
+        logits, h = mlp(X_with_S)
+        if task_type == "classification_binary":
+            loss = criterion(logits.view(-1, 1), y.to(device).view(-1, 1))
+        elif task_type == "classification_multiclass":
+            loss = criterion(logits, y.to(device))
+        else:
+            loss = criterion(logits, y.to(device))
+        loss_val = float(loss.detach().cpu().item())
+        loss.backward()
+        mlp.step()
+        ldm.update_ema(write_vector=h.detach(), alpha=alpha_s)
+        if epoch % log_every == 0 or epoch == 1 or epoch == epochs:
+            logs.append((epoch, loss_val))
+            emit(f"{name} epoch {epoch}/{epochs} loss={loss_val:.6f}")
+        if progress_update_fn:
+            try:
+                progress_update_fn(1)
+            except Exception:
+                pass
+    return logs
+
+
+def run_bench(cfg: Dict[str, Any], emit, stop_event: threading.Event, progress_cb=None) -> Dict[str, Any]:
+    start_time = time.time()
+    torch.manual_seed(cfg.get("seed", 42))
+    np.random.seed(cfg.get("seed", 42))
+
+    category_dims = {
+        "boolean": (2, 1),
+        "arithmetic": (1, 4),
+        "sequence": (cfg.get("max_seq_len", 12), 1),
+        "spatial": (cfg.get("spatial_img_size", 8) ** 2, 4),
+        "temporal": (cfg.get("temporal_max_len", 40), 1),
+    }
+    ldm = LiquidDataMatrix(latent_size=cfg.get("latent_size", 16), init_scale=0.01)
+    all_logs = {}
+    categories_to_run = cfg.get("selected_categories", list(category_dims.keys()))
+    total_epochs = 0
+    for cat in categories_to_run:
+        total_epochs += cfg.get("epochs_per_category_small", 1000) if cat == "boolean" else cfg.get("epochs_per_category", 100)
+    if total_epochs <= 0:
+        total_epochs = 1
+    completed_epochs = 0
+
+    def per_epoch_progress(n: int = 1):
+        nonlocal completed_epochs
+        completed_epochs += n
+        pct = int((completed_epochs / total_epochs) * 100)
+        pct = max(0, min(100, pct))
+        if progress_cb:
+            progress_cb(pct)
+
+    emit(f"Starting benchmark run at {now()}. Device: {device}")
+    emit(f"Categories: {', '.join(categories_to_run)}")
+    emit(f"Total epochs (approx): {total_epochs}")
+    try:
+        for cat in categories_to_run:
+            if stop_event.is_set():
+                emit(f"Stop requested before starting category {cat}.")
+                break
+            input_dim, output_dim = category_dims[cat]
+            mlp = SimpleMLP(
+                input_dim=input_dim + cfg.get("latent_size", 16),
+                hidden_dim=cfg.get("hidden_dim", 128),
+                output_dim=output_dim,
+                lr=cfg.get("lr", 1e-3),
+                seed=cfg.get("seed", 42)
+            )
+            epochs = cfg.get("epochs_per_category_small", 1000) if cat == "boolean" else cfg.get("epochs_per_category", 100)
+            dataset_kwargs = {}
+            if cat == "sequence":
+                dataset_kwargs = {"max_len": cfg.get("max_seq_len", 12)}
+            elif cat == "spatial":
+                dataset_kwargs = {"img_size": cfg.get("spatial_img_size", 8)}
+            elif cat == "temporal":
+                dataset_kwargs = {"max_len": cfg.get("temporal_max_len", 40)}
+            logs = train_category(
+                cat, mlp, ldm, epochs, cfg.get("batch_size", 128),
+                cfg.get("ema_alpha", 0.9), cfg.get("log_every", 25), dataset_kwargs, cfg, emit, stop_event, per_epoch_progress
+            )
+            all_logs[cat] = logs
+            if stop_event.is_set():
+                emit(f"Stopped after category {cat}.")
+                break
+        duration = time.time() - start_time
+        summary = {
+            "run_started_at": now(),
+            "duration_seconds": round(duration, 2),
+            "device": str(device),
+            "config": cfg,
+            "categories_run": categories_to_run,
+            "final_S_first8": ldm.S[:8].cpu().tolist(),
+            "category_logs": {
+                k: {"last_epoch": v[-1][0] if v else 0, "last_loss": float(v[-1][1]) if v else None}
+                for k, v in all_logs.items()
+            }
+        }
+        emit("Run complete.")
+        if progress_cb:
+            progress_cb(100)
+        return summary
+    except Exception as e:
+        emit(f"ERROR in run_bench: {e}\n{traceback.format_exc()}")
+        if progress_cb:
+            progress_cb(0)
+        raise
+
+
+def build_default_cfg() -> Dict[str, Any]:
+    return {
+        "epochs_per_category": 100,
+        "epochs_per_category_small": 1000,
+        "batch_size": 128,
+        "hidden_dim": 128,
+        "latent_size": 16,
+        "lr": 1e-3,
+        "seed": 42,
+        "log_every": 25,
+        "max_seq_len": 12,
+        "spatial_img_size": 8,
+        "temporal_max_len": 40,
+        "ema_alpha": 0.9,
+        "selected_categories": ["boolean", "arithmetic", "sequence", "spatial", "temporal"]
+    }
+
+
+def pretty_summary_text(summary: Dict[str, Any]) -> str:
+    lines = [f"Run summary ({summary.get('run_started_at', now())}):",
+             f"Duration (s): {summary.get('duration_seconds', 'N/A')}",
+             f"Device: {summary.get('device', 'N/A')}",
+             f"Categories run: {', '.join(summary.get('categories_run', []))}",
+             "Final LDM S (first 8 dims): " + ", ".join([f"{float(x):.6g}" for x in summary.get('final_S_first8', [])]),
+             "",
+             "Per-category (last recorded epoch, last loss):"]
+    for cat, info in summary.get('category_logs', {}).items():
+        last_epoch = info.get('last_epoch', 0)
+        last_loss = info.get('last_loss', None)
+        last_loss_str = f"{last_loss:.6f}" if (last_loss is not None) else "None"
+        lines.append(f"  {cat}: epoch={last_epoch}, loss={last_loss_str}")
+    return "\n".join(lines)
+
+
+# -------------------------
+# Qt Worker thread (runs the benchmark)
+# -------------------------
+class BenchWorker(QtCore.QThread):
+    log_signal = QtCore.Signal(str)
+    progress_signal = QtCore.Signal(int)
+    finished_signal = QtCore.Signal(dict)
+
+    def __init__(self, cfg, save_dir):
+        super().__init__()
+        self.cfg = cfg
+        self.save_dir = Path(save_dir)
+        self._stop_event = threading.Event()
+        self._result_summary = None
+
+    def run(self):
+        def emit(msg: str):
+            self.log_signal.emit(msg)
+
+        def progress_cb(pct: int):
+            self.progress_signal.emit(int(pct))
+
+        try:
+            try:
+                prepare_save_directory(self.save_dir)
+            except Exception as e:
+                emit(f"Warning: save dir issue: {e}. Falling back to temp dir.")
+                tmpd = tempfile.mkdtemp(prefix='benchmark_results_')
+                self.save_dir = Path(tmpd)
+                emit(f"Using: {self.save_dir}")
+
+            summary = run_bench(self.cfg, emit, self._stop_event, progress_cb)
+            self._result_summary = summary
+            summary_text = pretty_summary_text(summary)
+            emit("\n" + summary_text)
+            try:
+                with open(self.save_dir / 'summary.txt', 'w', encoding='utf-8') as f:
+                    f.write(summary_text)
+                with open(self.save_dir / 'summary.json', 'w', encoding='utf-8') as f:
+                    json.dump(summary, f, indent=2)
+                emit(f"\nWritten summary.txt and summary.json to {self.save_dir}")
+            except Exception as e:
+                emit(f"Failed to write summary files: {e}")
+            self.finished_signal.emit(self._result_summary or {})
+        except Exception as e:
+            emit(f"ERROR in worker: {e}\n{traceback.format_exc()}")
+            self.finished_signal.emit(self._result_summary or {})
+
+    def request_stop(self):
+        self._stop_event.set()
+
+
+# -------------------------
+# Qt GUI
+# -------------------------
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("LDM Benchmark — PySide6 + PyTorch")
+        self.resize(1000, 700)
+        self.worker = None
+        self.result_summary = None
+        self._build_ui()
+
+    def _build_ui(self):
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        layout = QtWidgets.QGridLayout()
+        central.setLayout(layout)
+
+        row = 0
+
+        title = QtWidgets.QLabel("<b>Stateful LDM Benchmark (PySide6 + PyTorch)</b>")
+        layout.addWidget(title, row, 0, 1, 4)
+        row += 1
+
+        layout.addWidget(QtWidgets.QLabel("Save folder:"), row, 0)
+        self.save_dir_edit = QtWidgets.QLineEdit(str(Path.cwd() / "benchmark_results"))
+        layout.addWidget(self.save_dir_edit, row, 1, 1, 2)
+        btn_browse = QtWidgets.QPushButton("Browse")
+        btn_browse.clicked.connect(self._browse_folder)
+        layout.addWidget(btn_browse, row, 3)
+        row += 1
+
+        # Hyperparams (allow >99 for epochs)
+        self.epochs_per_cat = QtWidgets.QSpinBox()
+        self.epochs_per_cat.setRange(1, 1_000_000)
+        self.epochs_per_cat.setValue(100)
+
+        self.epochs_small = QtWidgets.QSpinBox()
+        self.epochs_small.setRange(1, 1_000_000)
+        self.epochs_small.setValue(1000)
+
+        self.batch_size = QtWidgets.QSpinBox(); self.batch_size.setRange(1, 4096); self.batch_size.setValue(128)
+        self.hidden_dim = QtWidgets.QSpinBox(); self.hidden_dim.setRange(1, 8192); self.hidden_dim.setValue(128)
+        self.latent_size = QtWidgets.QSpinBox(); self.latent_size.setRange(1, 2048); self.latent_size.setValue(16)
+        self.lr_edit = QtWidgets.QDoubleSpinBox(); self.lr_edit.setDecimals(6); self.lr_edit.setRange(1e-6, 1.0); self.lr_edit.setSingleStep(1e-3); self.lr_edit.setValue(1e-3)
+        self.seed_edit = QtWidgets.QSpinBox(); self.seed_edit.setValue(42)
+        self.log_every = QtWidgets.QSpinBox(); self.log_every.setValue(25)
+        self.ema_alpha = QtWidgets.QDoubleSpinBox(); self.ema_alpha.setDecimals(3); self.ema_alpha.setRange(0.0, 1.0); self.ema_alpha.setValue(0.9)
+        self.max_seq_len = QtWidgets.QSpinBox(); self.max_seq_len.setValue(12)
+        self.spatial_img = QtWidgets.QSpinBox(); self.spatial_img.setValue(8)
+        self.temporal_max = QtWidgets.QSpinBox(); self.temporal_max.setValue(40)
+
+        # place hyperparams
+        layout.addWidget(QtWidgets.QLabel("epochs (per cat)"), row, 0); layout.addWidget(self.epochs_per_cat, row, 1)
+        layout.addWidget(QtWidgets.QLabel("boolean epochs"), row, 2); layout.addWidget(self.epochs_small, row, 3); row += 1
+        layout.addWidget(QtWidgets.QLabel("batch size"), row, 0); layout.addWidget(self.batch_size, row, 1)
+        layout.addWidget(QtWidgets.QLabel("lr"), row, 2); layout.addWidget(self.lr_edit, row, 3); row += 1
+        layout.addWidget(QtWidgets.QLabel("hidden dim"), row, 0); layout.addWidget(self.hidden_dim, row, 1)
+        layout.addWidget(QtWidgets.QLabel("latent size"), row, 2); layout.addWidget(self.latent_size, row, 3); row += 1
+        layout.addWidget(QtWidgets.QLabel("seed"), row, 0); layout.addWidget(self.seed_edit, row, 1)
+        layout.addWidget(QtWidgets.QLabel("log every"), row, 2); layout.addWidget(self.log_every, row, 3); row += 1
+        layout.addWidget(QtWidgets.QLabel("max_seq_len"), row, 0); layout.addWidget(self.max_seq_len, row, 1)
+        layout.addWidget(QtWidgets.QLabel("spatial img"), row, 2); layout.addWidget(self.spatial_img, row, 3); row += 1
+        layout.addWidget(QtWidgets.QLabel("temporal max"), row, 0); layout.addWidget(self.temporal_max, row, 1)
+        layout.addWidget(QtWidgets.QLabel("ema alpha"), row, 2); layout.addWidget(self.ema_alpha, row, 3); row += 1
+
+        categories_label = QtWidgets.QLabel("<b>Categories</b>")
+        layout.addWidget(categories_label, row, 0)
+        row += 1
+        self.cat_boolean = QtWidgets.QCheckBox("boolean"); self.cat_boolean.setChecked(True)
+        self.cat_arithmetic = QtWidgets.QCheckBox("arithmetic"); self.cat_arithmetic.setChecked(True)
+        self.cat_sequence = QtWidgets.QCheckBox("sequence"); self.cat_sequence.setChecked(True)
+        self.cat_spatial = QtWidgets.QCheckBox("spatial"); self.cat_spatial.setChecked(True)
+        self.cat_temporal = QtWidgets.QCheckBox("temporal"); self.cat_temporal.setChecked(True)
+        layout.addWidget(self.cat_boolean, row, 0); layout.addWidget(self.cat_arithmetic, row, 1)
+        layout.addWidget(self.cat_sequence, row, 2); layout.addWidget(self.cat_spatial, row, 3); row += 1
+        layout.addWidget(self.cat_temporal, row, 0); row += 1
+
+        self.btn_run = QtWidgets.QPushButton("Run")
+        self.btn_stop = QtWidgets.QPushButton("Stop"); self.btn_stop.setEnabled(False)
+        self.btn_save = QtWidgets.QPushButton("Save Summary"); self.btn_save.setEnabled(False)
+        hbox = QtWidgets.QHBoxLayout()
+        hbox.addWidget(self.btn_run); hbox.addWidget(self.btn_stop); hbox.addWidget(self.btn_save)
+        layout.addLayout(hbox, row, 0, 1, 4)
+        row += 1
+
+        self.progress = QtWidgets.QProgressBar(); self.progress.setRange(0, 100); self.progress.setValue(0)
+        layout.addWidget(self.progress, row, 0, 1, 4)
+        row += 1
+
+        self.log_text = QtWidgets.QTextEdit(); self.log_text.setReadOnly(True)
+        self.summary_text = QtWidgets.QTextEdit(); self.summary_text.setReadOnly(True)
+        tabs = QtWidgets.QTabWidget()
+        tabs.addTab(self.log_text, "Logs")
+        tabs.addTab(self.summary_text, "Summary")
+        layout.addWidget(tabs, row, 0, 4, 4)
+        row += 4
+
+        self.btn_run.clicked.connect(self._on_run)
+        self.btn_stop.clicked.connect(self._on_stop)
+        self.btn_save.clicked.connect(self._on_save)
+
+    def _browse_folder(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select folder", str(Path.cwd()))
+        if d:
+            self.save_dir_edit.setText(d)
+
+    def _append_log(self, s: str):
+        self.log_text.append(s)
+
+    def _set_progress(self, p: int):
+        self.progress.setValue(int(p))
+
+    def _on_run(self):
+        cfg = build_default_cfg()
+        try:
+            cfg['epochs_per_category'] = int(self.epochs_per_cat.value())
+            cfg['epochs_per_category_small'] = int(self.epochs_small.value())
+            cfg['batch_size'] = int(self.batch_size.value())
+            cfg['hidden_dim'] = int(self.hidden_dim.value())
+            cfg['latent_size'] = int(self.latent_size.value())
+            cfg['lr'] = float(self.lr_edit.value())
+            cfg['max_seq_len'] = int(self.max_seq_len.value())
+            cfg['spatial_img_size'] = int(self.spatial_img.value())
+            cfg['temporal_max_len'] = int(self.temporal_max.value())
+            cfg['seed'] = int(self.seed_edit.value())
+            cfg['log_every'] = int(self.log_every.value())
+            cfg['ema_alpha'] = float(self.ema_alpha.value())
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Invalid hyperparameter", str(e))
+            return
+
+        cats = []
+        for c, cb in [('boolean', self.cat_boolean), ('arithmetic', self.cat_arithmetic),
+                      ('sequence', self.cat_sequence), ('spatial', self.cat_spatial), ('temporal', self.cat_temporal)]:
+            if cb.isChecked():
+                cats.append(c)
+        if not cats:
+            QtWidgets.QMessageBox.critical(self, "Invalid", "Select at least one category.")
+            return
+        cfg['selected_categories'] = cats
+
+        save_dir = self.save_dir_edit.text() or str(Path.cwd() / "benchmark_results")
+        self.log_text.clear()
+        self.summary_text.clear()
+        self.btn_run.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.btn_save.setEnabled(False)
+        self.progress.setValue(0)
+
+        self.worker = BenchWorker(cfg, save_dir)
+        self.worker.log_signal.connect(self._append_log)
+        self.worker.progress_signal.connect(self._set_progress)
+        self.worker.finished_signal.connect(self._on_finished)
+        self.worker.start()
+
+    def _on_stop(self):
+        if self.worker:
+            self.worker.request_stop()
+            self._append_log("Stop requested — worker will stop as soon as possible.")
+            self.btn_stop.setEnabled(False)
+
+    def _on_finished(self, summary: dict):
+        self.result_summary = summary or {}
+        if summary:
+            self.summary_text.setPlainText(pretty_summary_text(summary))
+            self.btn_save.setEnabled(True)
+        self.btn_run.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self._append_log("Worker finished.")
+
+    def _on_save(self):
+        if not self.result_summary:
+            return
+        p = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose folder to save summary", str(Path.cwd()))
+        if not p:
+            return
+        try:
+            ppath = prepare_save_directory(Path(p))
+            summary_text = pretty_summary_text(self.result_summary)
+            with open(ppath / 'summary.txt', 'w', encoding='utf-8') as f:
+                f.write(summary_text)
+            with open(ppath / 'summary.json', 'w', encoding='utf-8') as f:
+                json.dump(self.result_summary, f, indent=2)
+            self._append_log(f"Saved summary to {ppath}")
+        except Exception as e:
+            self._append_log(f"Save failed: {e}")
+
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    main()
