@@ -1,5 +1,5 @@
 # liquid data matrix
-The learning space or liquid data matrix allows ai to take in and understand arbitrary data by musing a liquid data vector and arbitrary inferrence to abstract useful arbitrary data
+The learning space or liquid data matrix allows ai to take in and understand arbitrary data by using a liquid data vector and arbitrary inferrence to abstract useful arbitrary data
 which could allow for agi like capabilities
 
 i used ai to make the program yes(deepseek and gpt)
