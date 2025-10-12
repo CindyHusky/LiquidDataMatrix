@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-ldm_latent32_run_fixed.py
-
+ARC AGI at home:
 Compatibility-fixed training script:
 - MLP -> Latent Data Matrix -> MLP pipeline
 - torch.amp compatibility across PyTorch versions
