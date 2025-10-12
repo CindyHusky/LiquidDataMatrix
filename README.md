@@ -9,4 +9,4 @@ it has a liquid data matrix that perceptrons encode and infer arbitrary data fro
 
 it is to my knowledge nobody has tried this
 https://docs.google.com/document/d/1XZb5JXi3HcbAMMhFzEIpalIXwE36qla2JZPnN9-QQiY/edit?usp=sharing
-Heres a link to my research, apologies for the legibility
+Heres a link to my research, apologies for the lack of legibility
