@@ -619,8 +619,6 @@ def run_arc_tests(cfg: Dict[str, Any], emit=print, stop_event: Optional[threadin
     N_COLORS = env["N_COLORS"]
     DEVICE = env["DEVICE"]
 
-    os.makedirs(cfg.get("checkpoint_dir", "checkpoints_arc"), exist_ok=True)
-
     emit("Building ARC dataset...")
     X_all, Y_all, T_all = env["build_dataset"](int(cfg.get("n_examples", DEFAULT_CFG["n_examples"])))
     dl_train, dl_val, n_train = env["prepare_dataloaders"](X_all, Y_all, cfg)
@@ -878,7 +876,7 @@ def launch_tk_gui():
     from tkinter import scrolledtext
     import queue, threading, json, traceback, time, datetime, os
 
-    # Helper: current timestamp (use your existing now() if you prefer)
+    
     def now():
         return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
