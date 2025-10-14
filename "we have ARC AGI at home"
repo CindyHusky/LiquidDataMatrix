@@ -525,7 +525,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-# --- Put this near your other defaults ---
+
 DEFAULT_CFG = {
     "n_examples": 240,
     "train_val_split": 0.8,
