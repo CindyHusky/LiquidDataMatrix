@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
+
 """
 arc_strict_grid_aio.py — ARC grid-to-grid test harness (strict)
 
 - Runs only ARC-style grid-to-grid tasks (no arithmetic/boolean/spatial toy tasks).
 - Dataset: small synthetic ARC-like transformations (invert_color, mirror_h, add_border, paint_center).
 - Model: Encoder -> latent -> Decoder MLP (Pipeline).
-- Loss: per-pixel CrossEntropyLoss (multi-class over N_COLORS).
+- Loss: per-pixel CrossEntropyLoss or soft-target loss (for MixUp/CutMix).
 - Reports per-pixel train/val loss and pixel-accuracy, baseline, label distribution.
 - Adaptive weight decay optional.
 - CLI + Tk GUI (click-to-run) with Start/Stop and logs.
@@ -38,7 +39,9 @@ from tkinter import ttk, scrolledtext
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import Dataset, DataLoader
 
 # ------------------------
@@ -51,10 +54,21 @@ torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
+# performance helpers (safe defaults)
+torch.backends.cudnn.benchmark = True
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 def now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+import random
+from typing import Tuple, List
+import numpy as np
+import torch
+from torch.utils.data import Dataset
 
 # ------------------------
 # ARC-style synthetic dataset
@@ -63,15 +77,13 @@ GRID = 6
 N_COLORS = 6
 TASKS = ['invert_color', 'mirror_h', 'add_border', 'paint_center']
 
+
 def sample_task_instance(task: str, grid_size: int = GRID, n_colors: int = N_COLORS) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Creates one input grid (H,W) and target grid (H,W) for the selected ARC-style task.
-    Each cell is an integer label in [0, n_colors-1].
-    """
     x = np.zeros((grid_size, grid_size), dtype=np.int64)
     bg = random.randint(0, n_colors - 1)
     x.fill(bg)
-    # add random rectangles/patches to make instances non-trivial
+
+    # add random rectangles/patches
     for _ in range(random.randint(0, 2)):
         color = random.randint(0, n_colors - 1)
         r = random.randint(0, grid_size - 1)
@@ -84,14 +96,14 @@ def sample_task_instance(task: str, grid_size: int = GRID, n_colors: int = N_COL
 
     y = x.copy()
     if task == 'invert_color':
-        # swap two colors globally
+        # swap two distinct colors globally
         a, b = random.sample(range(n_colors), 2)
         mask_a = (x == a)
         mask_b = (x == b)
         y[mask_a] = b
         y[mask_b] = a
     elif task == 'mirror_h':
-        y = np.fliplr(x)
+        y = np.fliplr(x).copy()
     elif task == 'add_border':
         bc = random.randint(0, n_colors - 1)
         y[0, :] = bc
@@ -101,7 +113,6 @@ def sample_task_instance(task: str, grid_size: int = GRID, n_colors: int = N_COL
     elif task == 'paint_center':
         fc = random.randint(0, n_colors - 1)
         mid = grid_size // 2
-        # paint a small center square depending on grid_size
         r0 = max(0, mid - 1)
         r1 = min(grid_size, mid + 1)
         c0 = max(0, mid - 1)
@@ -112,13 +123,8 @@ def sample_task_instance(task: str, grid_size: int = GRID, n_colors: int = N_COL
 
     return x, y
 
-def build_dataset(n_examples: int) -> Tuple[np.ndarray, np.ndarray, list]:
-    """
-    Build a dataset of n_examples. Returns (X, Y, T) where X,Y are numpy arrays:
-      - X: (N, H, W) integer grids
-      - Y: (N, H, W) integer grids (targets)
-      - T: list of task names
-    """
+
+def build_dataset(n_examples: int) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     X, Y, T = [], [], []
     for _ in range(n_examples):
         t = random.choice(TASKS)
@@ -130,23 +136,38 @@ def build_dataset(n_examples: int) -> Tuple[np.ndarray, np.ndarray, list]:
     Y = np.stack(Y).astype(np.int64)
     return X, Y, T
 
+
 def one_hot_grid(arr: np.ndarray, n_colors: int = N_COLORS) -> np.ndarray:
     """
-    Convert integer grids (N,H,W) -> one-hot float arrays (N, H, W, N_COLORS).
+    Convert integer grids (N,H,W) -> one-hot float arrays in channel-first format (N, C, H, W).
+    Accepts input shape (H,W) single-grid as well.
     """
     arr = np.asarray(arr, dtype=np.int64)
+    if arr.ndim == 2:
+        arr = arr[np.newaxis, ...]
+    if arr.ndim != 3:
+        raise ValueError("one_hot_grid expects array of shape (N,H,W) or (H,W)")
     N, H, W = arr.shape
-    # use advanced indexing for clarity
-    return np.eye(n_colors, dtype=np.float32)[arr.reshape(-1)].reshape(N, H, W, n_colors)
+    flat = arr.reshape(-1)
+    if flat.max() >= n_colors or flat.min() < 0:
+        raise ValueError("one_hot_grid: values out of range [0, n_colors-1]")
+    eye = np.eye(n_colors, dtype=np.float32)   # (C,C)
+    onehot = eye[flat].reshape(N, H, W, n_colors)  # (N,H,W,C)
+    # convert to channel-first for PyTorch: (N, C, H, W)
+    onehot = onehot.transpose(0, 3, 1, 2).copy()
+    return onehot
+
 
 class PrecomputedArcDataset(Dataset):
     """
-    Dataset that returns (one-hot-input tensor, integer target tensor).
-    Input: float32 (H, W, N_COLORS)
+    Dataset that returns (input tensor, target tensor).
+    Input: float32 (C, H, W) channel-first one-hot
     Target: int64 (H, W)
     """
+
     def __init__(self, X_onehot: np.ndarray, Y: np.ndarray):
         assert X_onehot.shape[0] == Y.shape[0], "Mismatch between X and Y lengths"
+        # Expect X_onehot already channel-first (N, C, H, W)
         self.X = X_onehot
         self.Y = Y
 
@@ -154,56 +175,174 @@ class PrecomputedArcDataset(Dataset):
         return self.X.shape[0]
 
     def __getitem__(self, i: int):
-        x = torch.from_numpy(self.X[i]).float()    # (H, W, N_COLORS)
+        x = torch.from_numpy(self.X[i]).float()    # (C, H, W)
         y = torch.from_numpy(self.Y[i]).long()     # (H, W)
         return x, y
 
 # ------------------------
 # Model: Encoder -> latent -> Decoder
 # ------------------------
+import torch
+import torch.nn as nn
+from typing import Optional
+
+# module defaults (you can override per-class via constructor args)
+DEFAULT_GRID = 6
+DEFAULT_N_COLORS = 6
+
+
 class EncoderMLP(nn.Module):
-    def __init__(self, latent_dim: int = 256, hidden: int = 512):
+    """
+    Encoder MLP.
+
+    - expects input x of shape (B, C, H, W) or (B, H, W, C) where C == n_colors
+    - returns latent z of shape (B, latent_dim)
+    """
+    def __init__(
+        self,
+        latent_dim: int = 256,
+        hidden: int = 512,
+        grid: int = DEFAULT_GRID,
+        n_colors: int = DEFAULT_N_COLORS,
+    ):
         super().__init__()
+        self.grid = int(grid)
+        self.n_colors = int(n_colors)
+        input_dim = self.grid * self.grid * self.n_colors
+        # Flatten() will flatten from dim=1 -> (B, input_dim)
         self.net = nn.Sequential(
-            nn.Linear(GRID * GRID * N_COLORS, hidden),
+            nn.Flatten(),
+            nn.Linear(input_dim, hidden),
             nn.ReLU(inplace=True),
             nn.Linear(hidden, latent_dim),
-            nn.ReLU(inplace=True),
         )
 
+    def _ensure_ch_first(self, x: torch.Tensor) -> torch.Tensor:
+        # Accept NCHW or NHWC (robustness)
+        if x.dim() != 4:
+            raise ValueError(f"EncoderMLP expects a 4D tensor (B, C, H, W) or (B, H, W, C), got shape {tuple(x.shape)}")
+        # if already channel-first
+        if x.shape[1] == self.n_colors:
+            return x
+        # if channel-last NHWC
+        if x.shape[-1] == self.n_colors:
+            return x.permute(0, 3, 1, 2).contiguous()
+        raise ValueError(f"Input channel mismatch: expected {self.n_colors} channels but got shapes "
+                         f"C={x.shape[1]} or last={x.shape[-1]}")
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x.view(x.size(0), -1))
+        x = self._ensure_ch_first(x)
+        return self.net(x)
+
 
 class DecoderMLP(nn.Module):
-    def __init__(self, latent_dim: int = 256, hidden: int = 512):
+    """
+    Decoder MLP
+    - expects latent z (B, latent_dim)
+    - returns logits (B, C, H, W) suitable for nn.CrossEntropyLoss with targets (B, H, W)
+    """
+    def __init__(
+        self,
+        latent_dim: int = 256,
+        hidden: int = 512,
+        grid: int = DEFAULT_GRID,
+        n_colors: int = DEFAULT_N_COLORS,
+    ):
         super().__init__()
+        self.grid = int(grid)
+        self.n_colors = int(n_colors)
+        output_dim = self.grid * self.grid * self.n_colors
         self.net = nn.Sequential(
             nn.Linear(latent_dim, hidden),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden, GRID * GRID * N_COLORS),
+            nn.Linear(hidden, output_dim),
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return self.net(z).view(z.size(0), GRID, GRID, N_COLORS)
+        if z.dim() != 2:
+            raise ValueError(f"DecoderMLP expects a 2D latent (B, latent_dim), got shape {tuple(z.shape)}")
+        b = z.size(0)
+        out = self.net(z)                        # (B, output_dim)
+        out = out.view(b, self.n_colors, self.grid, self.grid)  # (B, C, H, W)
+        return out
+
 
 class Pipeline(nn.Module):
-    def __init__(self, latent_dim: int = 256, enc_h: int = 512, dec_h: int = 512):
+    """
+    Simple encoder->decoder pipeline returning logits (B, C, H, W).
+    """
+    def __init__(
+        self,
+        latent_dim: int = 256,
+        enc_h: int = 512,
+        dec_h: int = 512,
+        grid: int = DEFAULT_GRID,
+        n_colors: int = DEFAULT_N_COLORS,
+    ):
         super().__init__()
-        self.enc = EncoderMLP(latent_dim, enc_h)
-        self.dec = DecoderMLP(latent_dim, dec_h)
+        self.grid = int(grid)
+        self.n_colors = int(n_colors)
+        self.enc = EncoderMLP(latent_dim=latent_dim, hidden=enc_h, grid=self.grid, n_colors=self.n_colors)
+        self.dec = DecoderMLP(latent_dim=latent_dim, hidden=dec_h, grid=self.grid, n_colors=self.n_colors)
+
+    def _ensure_ch_first(self, x: torch.Tensor) -> torch.Tensor:
+        # same logic as EncoderMLP
+        if x.dim() != 4:
+            raise ValueError(f"Pipeline expects a 4D tensor (B, C, H, W) or (B, H, W, C), got shape {tuple(x.shape)}")
+        if x.shape[1] == self.n_colors:
+            return x
+        if x.shape[-1] == self.n_colors:
+            return x.permute(0, 3, 1, 2).contiguous()
+        raise ValueError(f"Input channel mismatch: expected {self.n_colors} channels but got shapes "
+                         f"C={x.shape[1]} or last={x.shape[-1]}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.enc(x)
-        logits = self.dec(z)
-        return logits  # (B, H, W, N_COLORS)
+        x = self._ensure_ch_first(x)
+        z = self.enc(x)      # (B, latent_dim)
+        logits = self.dec(z) # (B, C, H, W)
+        return logits
+
 
 def init_weights_xavier(module: nn.Module):
-    for m in module.modules():
-        if isinstance(m, (nn.Linear, nn.Conv2d, nn.ConvTranspose2d)):
-            if getattr(m, "weight", None) is not None:
-                nn.init.xavier_uniform_(m.weight)
-            if getattr(m, "bias", None) is not None:
-                nn.init.zeros_(m.bias)
+    """
+    Apply Xavier uniform init for Linear/Conv layers and zero biases.
+    Usage: model.apply(init_weights_xavier)
+    """
+    if isinstance(module, (nn.Linear, nn.Conv2d, nn.ConvTranspose2d)):
+        if getattr(module, "weight", None) is not None:
+            nn.init.xavier_uniform_(module.weight)
+        if getattr(module, "bias", None) is not None:
+            nn.init.zeros_(module.bias)
+
+
+if __name__ == "__main__":
+    # Quick model test
+    GRID = 6
+    N_COLORS = 6
+    BATCH = 4
+    latent_dim = 128
+
+    model = Pipeline(latent_dim=latent_dim, enc_h=256, dec_h=256, grid=GRID, n_colors=N_COLORS)
+    model.apply(init_weights_xavier)
+
+    # Test with channel-first (B, C, H, W)
+    x_nchw = torch.randn(BATCH, N_COLORS, GRID, GRID)
+    out1 = model(x_nchw)
+    assert out1.shape == (BATCH, N_COLORS, GRID, GRID)
+    print("NCHW pass:", out1.shape)
+
+    # Test with channel-last (B, H, W, C)
+    x_nhwc = torch.randn(BATCH, GRID, GRID, N_COLORS)
+    out2 = model(x_nhwc)
+    assert out2.shape == (BATCH, N_COLORS, GRID, GRID)
+    print("NHWC pass:", out2.shape)
+
+    # Ensure CrossEntropy compatibility: targets shape (B, H, W) of ints in [0, N_COLORS)
+    targets = torch.randint(0, N_COLORS, (BATCH, GRID, GRID), dtype=torch.long)
+    loss_fn = nn.CrossEntropyLoss()  # expects logits (B, C, H, W) and targets (B, H, W)
+    loss = loss_fn(out1, targets)
+    print("Loss computed:", float(loss))
+    print("Model test completed successfully.")
 
 # ------------------------
 # Adaptive Weight Decay (optional)
@@ -250,6 +389,72 @@ class AdaptiveWeightDecay:
 
         return grad_norm, new_wd
 
+
+# ------------------------
+# MixUp / CutMix helpers (operates on tensors shaped (B,H,W,C) one-hot channels last)
+# ------------------------
+def rand_beta(alpha: float) -> float:
+    if alpha <= 0.0:
+        return 1.0
+    return float(np.random.beta(alpha, alpha))
+
+
+def mixup_cutmix_batch(x: torch.Tensor, y: torch.Tensor, mixup_alpha: float = 0.2, cutmix_alpha: float = 1.0,
+                       prob: float = 0.5, device: torch.device = DEVICE):
+    """
+    x: (B, H, W, C) float
+    y: (B, H, W) long
+    Returns:
+      mixed_x: (B, H, W, C) float (on same device as x)
+      mixed_y_soft: (B*H*W, C) float soft labels (on device)
+    """
+    B, H, W, C = x.shape
+    x = x.to(device)
+    y = y.to(device)
+
+    if B == 1 or random.random() >= prob:
+        flat_targets = F.one_hot(y.view(-1), num_classes=C).float().to(device)
+        return x, flat_targets
+
+    # permutation indices
+    perm = torch.randperm(B, device=device)
+    x2 = x[perm]
+    y2 = y[perm]
+
+    if random.random() < 0.5:
+        # MixUp
+        lam = rand_beta(mixup_alpha)
+        lam_t = torch.tensor(lam, device=device, dtype=torch.float32)
+        mixed_x = lam_t * x + (1.0 - lam_t) * x2
+        t1 = F.one_hot(y.view(-1), num_classes=C).float().to(device)
+        t2 = F.one_hot(y2.view(-1), num_classes=C).float().to(device)
+        mixed_y = lam_t * t1 + (1.0 - lam_t) * t2
+        return mixed_x, mixed_y
+    else:
+        # CutMix on grid
+        lam = rand_beta(cutmix_alpha)
+        cut_ratio = math.sqrt(max(1.0 - lam, 0.0))
+        cut_h = max(1, int(round(H * cut_ratio)))
+        cut_w = max(1, int(round(W * cut_ratio)))
+
+        cy = random.randint(0, H - 1)
+        cx = random.randint(0, W - 1)
+        y1 = max(0, cy - cut_h // 2)
+        y2_ = min(H, cy + (cut_h - cut_h // 2))
+        x1 = max(0, cx - cut_w // 2)
+        x2_ = min(W, cx + (cut_w - cut_w // 2))
+
+        mixed_x = x.clone()
+        mixed_x[:, y1:y2_, x1:x2_, :] = x2[:, y1:y2_, x1:x2_, :]
+
+        patched_area = float((y2_ - y1) * (x2_ - x1))
+        lam_area = 1.0 - (patched_area / float(H * W))
+        t1 = F.one_hot(y.view(-1), num_classes=C).float().to(device)
+        t2 = F.one_hot(y2.view(-1), num_classes=C).float().to(device)
+        mixed_y = lam_area * t1 + (1.0 - lam_area) * t2
+        return mixed_x, mixed_y
+
+
 # ------------------------
 # DataLoaders helper
 # ------------------------
@@ -285,6 +490,7 @@ def prepare_dataloaders(X_all: np.ndarray, Y_all: np.ndarray, config: Dict[str, 
 
     return dl_train, dl_val, n_train
 
+
 def compute_majority_baseline_from_array(Y_all: np.ndarray, n_train: int) -> float:
     y_val = Y_all[n_train:].reshape(-1)
     if y_val.size == 0:
@@ -292,6 +498,7 @@ def compute_majority_baseline_from_array(Y_all: np.ndarray, n_train: int) -> flo
     cnt = Counter(y_val.tolist())
     mode_count = cnt.most_common(1)[0][1]
     return 100.0 * mode_count / y_val.size
+
 
 def label_distribution_from_array(Y_all: np.ndarray, n_train: int, n_colors: int = N_COLORS) -> np.ndarray:
     y_val = Y_all[n_train:].reshape(-1)
@@ -303,9 +510,22 @@ def label_distribution_from_array(Y_all: np.ndarray, n_train: int, n_colors: int
         counts[int(v)] = int(c)
     return counts
 
+
 # ------------------------
 # Core: run ARC grid tests (strict)
 # ------------------------
+import os
+import time
+import threading
+from typing import Any, Dict, Optional
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+# --- Put this near your other defaults ---
 DEFAULT_CFG = {
     "n_examples": 240,
     "train_val_split": 0.8,
@@ -314,8 +534,8 @@ DEFAULT_CFG = {
     "decoder_hidden": 512,
     "epochs": 8,
     "batch_size": 64,
-    "lr": 1e-3,
-    "weight_decay": 1e-5,
+    "lr": 3e-4,
+    "weight_decay": 1e-3,
     "num_workers": 2,
     "pin_memory": True,
     "checkpoint_dir": "checkpoints_arc",
@@ -324,54 +544,158 @@ DEFAULT_CFG = {
     "wd_resp": 1.0,
     "wd_min": 1e-6,
     "wd_max": 1e-2,
+    "mixup_alpha": 0.2,
+    "cutmix_alpha": 1.0,
+    "mix_prob": 0.5,
+    "label_smoothing": None,  # or 0.05 to enable CE label smoothing fallback
+    "save_every_n_epochs": 0,
+    "seed": None,  # optional: set int for deterministic runs
 }
 
+# ---------------------------
+# Utility helpers (light)
+# ---------------------------
+def _ensure_required(name: str):
+    raise RuntimeError(f"Required object/function '{name}' is not defined in the environment. "
+                       "Make sure it's imported or defined before calling run_arc_tests().")
+
+def _to_onehot(labels: torch.Tensor, n_classes: int, device=None, dtype=torch.float32):
+    # labels: (B,H,W) -> returns (B*H*W, n_classes)
+    flat = labels.view(-1).long()
+    onehot = torch.zeros((flat.shape[0], n_classes), device=device, dtype=dtype)
+    onehot.scatter_(1, flat.unsqueeze(1), 1.0)
+    return onehot
+
+# ---------------------------
+# Main upgraded function
+# ---------------------------
 def run_arc_tests(cfg: Dict[str, Any], emit=print, stop_event: Optional[threading.Event] = None) -> Dict[str, Any]:
     """
-    Runs strict ARC grid-to-grid training using Pipeline (encoder->decoder).
-    Returns a summary dict.
+    Upgraded/robust run_arc_tests wrapper.
+    Expects the following names to be available in the module globals:
+      - build_dataset(n_examples) -> (X_all, Y_all, T_all)
+      - prepare_dataloaders(X_all, Y_all, cfg) -> (dl_train, dl_val, n_train)
+      - Pipeline(latent_dim, enc_hidden, dec_hidden) -> nn.Module
+      - init_weights_xavier(model)
+      - AdaptiveWeightDecay (callable class)
+      - mixup_cutmix_batch(xb, yb, mixup_alpha, cutmix_alpha, prob, device) -> (mixed_x, mixed_y_or_None)
+      - compute_majority_baseline_from_array(Y_all, n_train)
+      - label_distribution_from_array(Y_all, n_train, N_COLORS)
+      - GRID (int), N_COLORS (int), DEVICE (torch.device)
     """
+    # --- Basic validation and defaults ---
     if stop_event is None:
         stop_event = threading.Event()
 
+    # merge cfg over DEFAULT_CFG without modifying DEFAULT_CFG
+    cfg = {**DEFAULT_CFG, **(cfg or {})}
+
+    # deterministic seed if provided
+    seed = cfg.get("seed", None)
+    if seed is not None:
+        np.random.seed(int(seed))
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+
+    # verify required globals exist in the environment, raise helpful errors if not
+    env = globals()
+    for name in ("build_dataset", "prepare_dataloaders", "Pipeline", "init_weights_xavier",
+                 "mixup_cutmix_batch", "compute_majority_baseline_from_array", "label_distribution_from_array"):
+        if name not in env:
+            _ensure_required(name)
+    # Optional class
+    has_awd = "AdaptiveWeightDecay" in env
+
+    # ensure GRID, N_COLORS, DEVICE exist
+    if "GRID" not in env:
+        _ensure_required("GRID")
+    if "N_COLORS" not in env:
+        _ensure_required("N_COLORS")
+    if "DEVICE" not in env:
+        _ensure_required("DEVICE")
+
+    GRID = env["GRID"]
+    N_COLORS = env["N_COLORS"]
+    DEVICE = env["DEVICE"]
+
     os.makedirs(cfg.get("checkpoint_dir", "checkpoints_arc"), exist_ok=True)
+
     emit("Building ARC dataset...")
-    X_all, Y_all, T_all = build_dataset(cfg.get("n_examples", DEFAULT_CFG["n_examples"]))
-    dl_train, dl_val, n_train = prepare_dataloaders(X_all, Y_all, cfg)
-    emit(f"Train size: {len(dl_train.dataset)} Val size: {len(dl_val.dataset)}")
+    X_all, Y_all, T_all = env["build_dataset"](int(cfg.get("n_examples", DEFAULT_CFG["n_examples"])))
+    dl_train, dl_val, n_train = env["prepare_dataloaders"](X_all, Y_all, cfg)
+
+    emit(f"Train size: {len(dl_train.dataset)}  Val size: {len(dl_val.dataset)}")
     emit(f"Device: {DEVICE}")
 
-    baseline = compute_majority_baseline_from_array(Y_all, n_train)
-    emit(f"Majority-class baseline (val) = {baseline:.2f}%")
-    distr = label_distribution_from_array(Y_all, n_train, N_COLORS)
-    emit("Validation label distribution (per-class counts): " + ", ".join(str(int(x)) for x in distr.tolist()))
+    # baseline & distribution (guard with try)
+    try:
+        baseline = env["compute_majority_baseline_from_array"](Y_all, n_train)
+        emit(f"Majority-class baseline (val) = {baseline:.2f}%")
+    except Exception as ex:
+        emit(f"Warning: could not compute majority baseline: {ex}")
+        baseline = None
 
-    # model, optimizer, criterion
-    model = Pipeline(cfg.get("latent_dim", 256), cfg.get("encoder_hidden", 512), cfg.get("decoder_hidden", 512)).to(DEVICE)
-    init_weights_xavier(model)
+    try:
+        distr = env["label_distribution_from_array"](Y_all, n_train, N_COLORS)
+        emit("Validation label distribution (per-class counts): " + ", ".join(str(int(x)) for x in distr.tolist()))
+    except Exception:
+        pass
 
-    optimizer = optim.AdamW(model.parameters(), lr=cfg.get("lr", 1e-3), weight_decay=cfg.get("weight_decay", 1e-5))
-    criterion = nn.CrossEntropyLoss()
+    # model, init, device
+    model = env["Pipeline"](int(cfg.get("latent_dim")), int(cfg.get("encoder_hidden")), int(cfg.get("decoder_hidden")))
+    try:
+        env["init_weights_xavier"](model)
+    except Exception:
+        # non-fatal: some users prefer custom init; continue
+        emit("init_weights_xavier not applied (missing or failed) — continuing with default init")
 
+    model = model.to(DEVICE)
+
+    optimizer = optim.AdamW(model.parameters(), lr=float(cfg.get("lr", 3e-4)), weight_decay=float(cfg.get("weight_decay", 1e-3)))
+    # ensure T_max >= 1
+    epochs = max(1, int(cfg.get("epochs", 8)))
+    try:
+        scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
+    except Exception:
+        scheduler = None
+
+    # criterion: if label_smoothing provided and we use hard labels in validation, it's safe to construct CE with smoothing.
+    use_label_smoothing = cfg.get("label_smoothing", None)
+    if use_label_smoothing:
+        criterion_ce = nn.CrossEntropyLoss(label_smoothing=float(use_label_smoothing))
+    else:
+        criterion_ce = nn.CrossEntropyLoss()
+
+    # adaptive weight decay (optional)
     awd = None
     if cfg.get("adaptive_wd", False):
-        awd = AdaptiveWeightDecay(
-            optimizer,
-            base_wd=cfg.get("weight_decay", 1e-5),
-            ema_decay=cfg.get("wd_ema_decay", 0.98),
-            resp=cfg.get("wd_resp", 1.0),
-            wd_min=cfg.get("wd_min", 1e-6),
-            wd_max=cfg.get("wd_max", 1e-2),
-        )
+        if has_awd:
+            awd_cls = env["AdaptiveWeightDecay"]
+            awd = awd_cls(
+                optimizer,
+                base_wd=float(cfg.get("weight_decay", 1e-5)),
+                ema_decay=float(cfg.get("wd_ema_decay", 0.98)),
+                resp=float(cfg.get("wd_resp", 1.0)),
+                wd_min=float(cfg.get("wd_min", 1e-6)),
+                wd_max=float(cfg.get("wd_max", 1e-2)),
+            )
+        else:
+            emit("AdaptiveWeightDecay requested but not available in environment; continuing without AWDecay.")
+            awd = None
 
-    GRID_PIXELS = GRID * GRID
+    # useful constants
+    GRID_PIXELS = int(GRID * GRID)
     total_examples_processed = 0
-    start_time = time.time()
     total_steps = 0
-    for epoch in range(1, cfg.get("epochs", 8) + 1):
+    start_time = time.time()
+
+    # training loop
+    for epoch in range(1, epochs + 1):
         if stop_event.is_set():
             emit(f"Stop requested before epoch {epoch}.")
             break
+
         model.train()
         total_train_pixel_loss = 0.0
         epoch_wd_accum = 0.0
@@ -382,22 +706,61 @@ def run_arc_tests(cfg: Dict[str, Any], emit=print, stop_event: Optional[threadin
         for xb, yb in dl_train:
             if stop_event.is_set():
                 break
-            xb, yb = xb.to(DEVICE), yb.to(DEVICE)  # xb: (B,H,W,C), yb: (B,H,W)
-            optimizer.zero_grad()
-            logits = model(xb)  # (B,H,W,C)
-            B = logits.shape[0]
-            loss = criterion(logits.view(B * GRID_PIXELS, N_COLORS), yb.view(-1))
-            loss.backward()
-            if awd is not None:
-                grad_norm, cur_wd = awd.step_update()
-                epoch_wd_accum += cur_wd
-                wd_steps += 1
-            optimizer.step()
-            total_train_pixel_loss += loss.item() * (B * GRID_PIXELS)
 
+            xb = xb.to(DEVICE)
+            yb = yb.to(DEVICE)
+
+            # Apply MixUp/CutMix - the helper may return (mixed_x, mixed_y) where mixed_y is either:
+            # - a soft label tensor shaped (B*H*W, N_COLORS), or
+            # - None meaning "no mixing was applied" (we then compute one-hot from yb)
+            mixed_x, mixed_y = env["mixup_cutmix_batch"](
+                xb, yb,
+                mixup_alpha=float(cfg.get("mixup_alpha", 0.2)),
+                cutmix_alpha=float(cfg.get("cutmix_alpha", 1.0)),
+                prob=float(cfg.get("mix_prob", 0.5)),
+                device=DEVICE
+            )
+
+            # If mixed_y is None, convert hard labels to one-hot soft targets
+            B = xb.shape[0]
+            if mixed_y is None:
+                target_soft = _to_onehot(yb, N_COLORS, device=DEVICE, dtype=torch.float32)
+            else:
+                # assume mix function returned (B*H*W, N_COLORS) shaped soft targets already on-device or not
+                target_soft = mixed_y.to(DEVICE) if not mixed_y.device == DEVICE else mixed_y
+
+            optimizer.zero_grad()
+            logits = model(mixed_x)  # expected (B, H, W, C)
+            # flatten to (B*H*W, C)
+            logits_flat = logits.view(B * GRID_PIXELS, N_COLORS)
+
+            # soft-target loss: -sum(target * log_prob) averaged over pixels
+            logp = F.log_softmax(logits_flat, dim=1)
+            loss = -(target_soft * logp).sum(dim=1).mean()
+
+            loss.backward()
+
+            # adaptive WD step if present
+            if awd is not None:
+                try:
+                    grad_norm, cur_wd = awd.step_update()
+                    epoch_wd_accum += float(cur_wd)
+                    wd_steps += 1
+                except Exception as ex:
+                    emit(f"Warning: AdaptiveWeightDecay.step_update failed: {ex}")
+
+            optimizer.step()
+            total_train_pixel_loss += float(loss.item()) * (B * GRID_PIXELS)
             total_examples_processed += (B * GRID_PIXELS)
             steps_this_epoch += 1
             total_steps += 1
+
+        # scheduler step (epoch end)
+        if scheduler is not None:
+            try:
+                scheduler.step()
+            except Exception as ex:
+                emit(f"Warning: scheduler.step() failed: {ex}")
 
         train_loss_per_pixel = total_train_pixel_loss / max(1, len(dl_train.dataset) * GRID_PIXELS)
 
@@ -410,39 +773,72 @@ def run_arc_tests(cfg: Dict[str, Any], emit=print, stop_event: Optional[threadin
             for xb, yb in dl_val:
                 if stop_event.is_set():
                     break
-                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-                B = xb.shape[0]
+                xb = xb.to(DEVICE)
+                yb = yb.to(DEVICE)
+                Bv = xb.shape[0]
                 logits = model(xb)
-                vloss = criterion(logits.view(B * GRID_PIXELS, N_COLORS), yb.view(-1))
-                total_val_pixel_loss += vloss.item() * (B * GRID_PIXELS)
+                vloss = criterion_ce(logits.view(Bv * GRID_PIXELS, N_COLORS), yb.view(-1))
+                total_val_pixel_loss += float(vloss.item()) * (Bv * GRID_PIXELS)
                 preds = logits.argmax(dim=-1)
-                correct += (preds == yb).sum().item()
+                correct += int((preds == yb).sum().item())
                 total += int(preds.numel())
 
-        # avoid division by zero if val set is empty (shouldn't happen but guard)
         val_loss_per_pixel = total_val_pixel_loss / max(1, len(dl_val.dataset) * GRID_PIXELS)
         acc = 100.0 * correct / total if total > 0 else 0.0
         elapsed = time.time() - t0
-        avg_wd = (epoch_wd_accum / wd_steps) if wd_steps > 0 else optimizer.param_groups[0].get('weight_decay', cfg.get("weight_decay"))
+        avg_wd = (epoch_wd_accum / wd_steps) if wd_steps > 0 else optimizer.param_groups[0].get('weight_decay', float(cfg.get("weight_decay", 1e-3)))
 
-        # throughput metrics
-        epoch_examples = len(dl_train.dataset) * GRID_PIXELS
+        # throughput metrics (guard elapsed > 0)
+        epoch_examples = max(1, len(dl_train.dataset) * GRID_PIXELS)
         examples_per_sec = epoch_examples / elapsed if elapsed > 0 else float("inf")
         steps_per_sec = (steps_this_epoch / elapsed) if elapsed > 0 else float("inf")
 
-        emit(f"[Epoch {epoch}/{cfg.get('epochs')}] train_loss(pix)={train_loss_per_pixel:.6f} val_loss(pix)={val_loss_per_pixel:.6f} val_acc={acc:.2f}% time={elapsed:.4f}s wd={avg_wd:.6g} examples/s={examples_per_sec:.2f} steps/s={steps_per_sec:.2f}")
+        emit(f"[Epoch {epoch}/{epochs}] train_loss(pix)={train_loss_per_pixel:.6f} val_loss(pix)={val_loss_per_pixel:.6f} "
+             f"val_acc={acc:.2f}% time={elapsed:.4f}s wd={avg_wd:.6g} examples/s={examples_per_sec:.2f} steps/s={steps_per_sec:.2f}")
+
+        # optionally save checkpoint
+        try:
+            if cfg.get("save_every_n_epochs", 1) and (epoch % int(cfg.get("save_every_n_epochs", 1)) == 0):
+                ckpt_path = os.path.join(cfg.get("checkpoint_dir", "checkpoints_arc"), f"ckpt_epoch{epoch}.pt")
+                torch.save({
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "cfg": cfg,
+                }, ckpt_path)
+                emit(f"Saved checkpoint: {ckpt_path}")
+        except Exception as ex:
+            emit(f"Warning: failed to save checkpoint: {ex}")
 
     duration = time.time() - start_time
     emit("ARC grid-to-grid training finished.")
+
+    # build JSON-friendly config (convert numpy ints)
+    safe_config = {}
+    for k, v in cfg.items():
+        if isinstance(v, (np.integer,)):
+            safe_config[k] = int(v)
+        else:
+            try:
+                # attempt json-friendly scalar conversion for numpy types
+                if isinstance(v, (np.floating, np.bool_)):
+                    safe_config[k] = v.item()
+                else:
+                    safe_config[k] = v
+            except Exception:
+                safe_config[k] = str(v)
+
     summary = {
-        'run_started_at': now(),
+        'run_started_at': time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)),
         'duration_seconds': float(duration),
         'device': str(DEVICE),
-        'config': cfg,
+        'config': safe_config,
         'total_examples_processed': int(total_examples_processed),
         'total_steps': int(total_steps),
+        'final_val_accuracy_percent': float(acc),
     }
     return summary
+
 
 # ------------------------
 # Quick self-test (ARC-only)
@@ -461,6 +857,7 @@ def quick_self_test_arc(emit=print):
             "adaptive_wd": False,
             "num_workers": 0,
             "pin_memory": False,
+            "mix_prob": 0.0,  # disable mixing for quick smoke-run by default
         })
         stop_event = threading.Event()
         summary = run_arc_tests(cfg, emit=emit, stop_event=stop_event)
@@ -471,73 +868,241 @@ def quick_self_test_arc(emit=print):
         emit(repr(e))
         traceback.print_exc()
 
+
 # ------------------------
 # GUI (Tkinter) — streamlined for ARC-only runs
 # ------------------------
 def launch_tk_gui():
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+    from tkinter import scrolledtext
+    import queue, threading, json, traceback, time, datetime, os
+
+    # Helper: current timestamp (use your existing now() if you prefer)
+    def now():
+        return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Simple tooltip class
+    class ToolTip:
+        def __init__(self, widget, text):
+            self.widget = widget
+            self.text = text
+            self.tip = None
+            widget.bind("<Enter>", self.show)
+            widget.bind("<Leave>", self.hide)
+
+        def show(self, _e=None):
+            if self.tip or not self.text:
+                return
+            x, y, cx, cy = self.widget.bbox("insert") if hasattr(self.widget, "bbox") else (0,0,0,0)
+            x += self.widget.winfo_rootx() + 20
+            y += self.widget.winfo_rooty() + 10
+            self.tip = tk.Toplevel(self.widget)
+            self.tip.overrideredirect(True)
+            lbl = tk.Label(self.tip, text=self.text, justify="left", background="#ffffe0", relief="solid", borderwidth=1, padx=4, pady=2)
+            lbl.pack()
+
+        def hide(self, _e=None):
+            if self.tip:
+                self.tip.destroy()
+                self.tip = None
+
+    # ---------- Main window ----------
     root = tk.Tk()
     root.title("ARC Strict Grid AIO — Click & Run")
-    root.geometry("760x540")
+    try:
+        # small modern-ish geometry, allow resizing
+        root.geometry("920x640")
+        root.minsize(760, 480)
+    except Exception:
+        pass
 
-    frm = ttk.Frame(root, padding=10)
+    # ---------- Styles ----------
+    style = ttk.Style(root)
+    # Use default theme but tweak a few things for a sleeker look
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+    style.configure("Header.TLabel", font=("Segoe UI", 11, "bold"))
+    style.configure("TFrame", padding=6)
+    style.configure("TButton", padding=6)
+    style.configure("Small.TEntry", padding=4)
+    style.configure("Info.TLabel", foreground="#2b6cb0")
+    style.configure("Status.TLabel", foreground="#155724", background="#d4edda", padding=4)
+
+    frm = ttk.Frame(root)
     frm.pack(fill="both", expand=True)
 
-    cfg_frame = ttk.LabelFrame(frm, text="Run Configuration", padding=8)
-    cfg_frame.pack(fill="x")
+    # ---------- Menu ----------
+    menubar = tk.Menu(root)
+    file_menu = tk.Menu(menubar, tearoff=0)
+    def save_log_to_file():
+        try:
+            path = filedialog.asksaveasfilename(defaultextension=".log", filetypes=[("Log files", "*.log"), ("Text files", "*.txt")])
+            if not path:
+                return
+            content = log_box.get("1.0", "end").strip()
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            emit_to_queue(f"Saved log to {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Save failed", repr(e))
+    file_menu.add_command(label="Save Log...", command=save_log_to_file)
+    file_menu.add_separator()
+    file_menu.add_command(label="Exit", command=root.quit)
+    menubar.add_cascade(label="File", menu=file_menu)
 
-    ttk.Label(cfg_frame, text="n_examples:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
-    n_examples_var = tk.IntVar(value=DEFAULT_CFG["n_examples"])
-    ttk.Entry(cfg_frame, textvariable=n_examples_var, width=10).grid(row=0, column=1, sticky="w")
+    help_menu = tk.Menu(menubar, tearoff=0)
+    help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", "ARC Strict Grid AIO — Click & Run\nMade snazzier"))
+    menubar.add_cascade(label="Help", menu=help_menu)
+    root.config(menu=menubar)
 
-    ttk.Label(cfg_frame, text="Batch size:").grid(row=0, column=2, sticky="w", padx=4, pady=4)
-    batch_var = tk.IntVar(value=DEFAULT_CFG["batch_size"])
-    ttk.Entry(cfg_frame, textvariable=batch_var, width=8).grid(row=0, column=3, sticky="w")
+    # ---------- Top: Run Configuration & Controls ----------
+    top_pane = ttk.Frame(frm)
+    top_pane.pack(fill="x", padx=8, pady=(8, 0))
 
-    ttk.Label(cfg_frame, text="Epochs:").grid(row=1, column=0, sticky="w", padx=4, pady=4)
-    epochs_var = tk.IntVar(value=DEFAULT_CFG["epochs"])
-    ttk.Entry(cfg_frame, textvariable=epochs_var, width=8).grid(row=1, column=1, sticky="w")
+    cfg_frame = ttk.LabelFrame(top_pane, text="Run Configuration")
+    cfg_frame.pack(side="left", fill="x", expand=True, padx=(0,8))
 
-    ttk.Label(cfg_frame, text="latent_dim:").grid(row=1, column=2, sticky="w", padx=4, pady=4)
-    latent_var = tk.IntVar(value=DEFAULT_CFG["latent_dim"])
-    ttk.Entry(cfg_frame, textvariable=latent_var, width=8).grid(row=1, column=3, sticky="w")
+    # Grid layout for config entries
+    # Labels/entries
+    ttk.Label(cfg_frame, text="n_examples:", style="Header.TLabel").grid(row=0, column=0, sticky="w", padx=6, pady=6)
+    n_examples_var = tk.IntVar(value=DEFAULT_CFG.get("n_examples", 120))
+    ttk.Entry(cfg_frame, textvariable=n_examples_var, width=10, style="Small.TEntry").grid(row=0, column=1, sticky="w", padx=2)
 
-    adaptive_var = tk.BooleanVar(value=DEFAULT_CFG["adaptive_wd"])
-    ttk.Checkbutton(cfg_frame, text="adaptive_wd", variable=adaptive_var).grid(row=2, column=0, padx=4, pady=4, sticky="w")
+    ttk.Label(cfg_frame, text="Batch size:", style="Header.TLabel").grid(row=0, column=2, sticky="w", padx=6, pady=6)
+    batch_var = tk.IntVar(value=DEFAULT_CFG.get("batch_size", 128))
+    ttk.Entry(cfg_frame, textvariable=batch_var, width=8, style="Small.TEntry").grid(row=0, column=3, sticky="w", padx=2)
 
-    # Logs
-    log_frame = ttk.LabelFrame(frm, text="Logs", padding=8)
-    log_frame.pack(fill="both", expand=True, pady=(8, 0))
-    log_box = scrolledtext.ScrolledText(log_frame, state="disabled", wrap="word")
-    log_box.pack(fill="both", expand=True)
+    ttk.Label(cfg_frame, text="Epochs:", style="Header.TLabel").grid(row=1, column=0, sticky="w", padx=6, pady=6)
+    epochs_var = tk.IntVar(value=DEFAULT_CFG.get("epochs", 128))
+    ttk.Entry(cfg_frame, textvariable=epochs_var, width=8, style="Small.TEntry").grid(row=1, column=1, sticky="w", padx=2)
 
-    # Buttons
-    btn_frame = ttk.Frame(frm)
-    btn_frame.pack(fill="x", pady=8)
-    start_btn = ttk.Button(btn_frame, text="Start")
-    start_btn.pack(side="left")
-    stop_btn = ttk.Button(btn_frame, text="Stop", state="disabled")
-    stop_btn.pack(side="left", padx=6)
-    quick_btn = ttk.Button(btn_frame, text="Quick Self-Test")
-    quick_btn.pack(side="left", padx=6)
+    ttk.Label(cfg_frame, text="latent_dim:", style="Header.TLabel").grid(row=1, column=2, sticky="w", padx=6, pady=6)
+    latent_var = tk.IntVar(value=DEFAULT_CFG.get("latent_dim", 512))
+    ttk.Entry(cfg_frame, textvariable=latent_var, width=8, style="Small.TEntry").grid(row=1, column=3, sticky="w", padx=2)
 
+    adaptive_var = tk.BooleanVar(value=DEFAULT_CFG.get("adaptive_wd", False))
+    adaptive_cb = ttk.Checkbutton(cfg_frame, text="adaptive_wd", variable=adaptive_var)
+    adaptive_cb.grid(row=2, column=0, padx=6, pady=6, sticky="w")
+    ToolTip(adaptive_cb, "Enable adaptive weight decay during training")
+
+    # Quick presets dropdown
+    presets = {"Small test": {"n_examples": 32, "batch_size": 8, "epochs": 2, "latent_dim": 64},
+               "Default": DEFAULT_CFG,
+               "Full run": {"n_examples": 1200, "batch_size": 256, "epochs": 256, "latent_dim": 1024}}
+    preset_var = tk.StringVar(value="Default")
+    ttk.Label(cfg_frame, text="Preset:", style="Header.TLabel").grid(row=2, column=2, sticky="w", padx=6, pady=6)
+    preset_menu = ttk.OptionMenu(cfg_frame, preset_var, "Default", *presets.keys(),
+                                 command=lambda p: [n_examples_var.set(presets[p].get("n_examples", n_examples_var.get())),
+                                                    batch_var.set(presets[p].get("batch_size", batch_var.get())),
+                                                    epochs_var.set(presets[p].get("epochs", epochs_var.get())),
+                                                    latent_var.set(presets[p].get("latent_dim", latent_var.get()))])
+    preset_menu.grid(row=2, column=3, sticky="w", padx=2)
+
+    # ---------- Toolbar (Start / Stop / Quick Test) ----------
+    toolbar = ttk.Frame(top_pane)
+    toolbar.pack(side="right", fill="y")
+
+    start_btn = ttk.Button(toolbar, text="Start ▶")
+    start_btn.pack(side="top", pady=(6,4), padx=4, fill="x")
+    # NOTE: stop button is intentionally AVAILABLE at all times (user requested)
+    stop_btn = ttk.Button(toolbar, text="Stop ■", state="normal")
+    stop_btn.pack(side="top", pady=4, padx=4, fill="x")
+    quick_btn = ttk.Button(toolbar, text="Quick Self-Test ✦")
+    quick_btn.pack(side="top", pady=4, padx=4, fill="x")
+
+    # Progress + status bar
+    pb = ttk.Progressbar(toolbar, mode="determinate", maximum=100)
+    pb.pack(side="top", padx=6, pady=(12,6), fill="x")
+    status_lbl = ttk.Label(frm, text="Idle", style="Status.TLabel")
+    status_lbl.pack(side="bottom", fill="x", padx=8, pady=6)
+
+    # ---------- Logs (center) ----------
+    mid_pane = ttk.Frame(frm)
+    mid_pane.pack(fill="both", expand=True, padx=8, pady=(8,0))
+
+    log_frame = ttk.LabelFrame(mid_pane, text="Logs")
+    log_frame.pack(fill="both", expand=True)
+
+    log_box = scrolledtext.ScrolledText(log_frame, state="disabled", wrap="word", height=18)
+    log_box.pack(fill="both", expand=True, padx=4, pady=4)
+
+    # Configure log text tags for colored levels
+    log_box.tag_config("INFO", foreground="#0b5fff")
+    log_box.tag_config("SUCCESS", foreground="#075e2d")
+    log_box.tag_config("WARN", foreground="#7a5219")
+    log_box.tag_config("ERROR", foreground="#b00020", underline=1)
+    log_box.tag_config("TIMESTAMP", foreground="#6b7280", font=("Courier", 8))
+
+    # ---------- Footer controls ----------
+    footer = ttk.Frame(frm)
+    footer.pack(fill="x", padx=8, pady=8)
+    save_log_btn = ttk.Button(footer, text="Save Log")
+    save_log_btn.pack(side="right")
+    ToolTip(save_log_btn, "Save the current log to a file")
+
+    # queue + threading state
     q = queue.Queue()
     stop_event = threading.Event()
     worker_thread = None
 
-    def emit_to_queue(msg: str):
-        q.put(msg)
+    def emit_to_queue(msg: str, level="INFO"):
+        # allow emitting structured progress messages like "PROGRESS:45"
+        q.put(("MSG", msg, level))
+
+    def emit_progress(pct: float):
+        q.put(("PROGRESS", pct))
 
     def poll_queue():
+        # Read queue and update UI
         try:
             while True:
-                msg = q.get_nowait()
-                log_box.configure(state="normal")
-                log_box.insert("end", f"{now()} | {msg}\n")
-                log_box.see("end")
-                log_box.configure(state="disabled")
+                item = q.get_nowait()
+                if item[0] == "MSG":
+                    _, msg, level = item
+                    # Special UI restore message (run finished / interrupted)
+                    if msg == "UI:restore":
+                        # Re-enable configuration widgets
+                        for child in cfg_frame.winfo_children():
+                            try:
+                                child.configure(state="normal")
+                            except Exception:
+                                pass
+                        # restore main buttons and progress/status
+                        start_btn.config(state="normal")
+                        # keep stop button available for user as requested
+                        stop_btn.config(state="normal")
+                        pb['value'] = 0
+                        status_lbl.config(text="Idle")
+                        stop_event.clear()
+                        q.task_done()
+                        continue
+
+                    # normal log messages
+                    log_box.configure(state="normal")
+                    log_box.insert("end", f"{now()} | ", "TIMESTAMP")
+                    log_box.insert("end", f"{msg}\n", level)
+                    log_box.see("end")
+                    log_box.configure(state="disabled")
+                    # quick visual status
+                    if level == "ERROR":
+                        status_lbl.config(text="Error", style="Status.TLabel")
+                    elif level == "WARN":
+                        status_lbl.config(text="Warning", style="Status.TLabel")
+                    else:
+                        status_lbl.config(text="Running" if start_btn['state']=="disabled" else "Idle", style="Status.TLabel")
+                elif item[0] == "PROGRESS":
+                    _, pct = item
+                    try:
+                        pb['value'] = float(pct)
+                    except Exception:
+                        pass
+                q.task_done()
         except queue.Empty:
             pass
-        root.after(200, poll_queue)
+        root.after(150, poll_queue)
 
     def make_cfg():
         return {
@@ -547,8 +1112,8 @@ def launch_tk_gui():
             "latent_dim": int(latent_var.get()),
             "encoder_hidden": int(max(64, latent_var.get())),
             "decoder_hidden": int(max(64, latent_var.get())),
-            "lr": 1e-3,
-            "weight_decay": 1e-5,
+            "lr": 3e-4,
+            "weight_decay": 1e-3,
             "num_workers": 0,
             "pin_memory": True,
             "checkpoint_dir": "checkpoints_arc",
@@ -558,51 +1123,87 @@ def launch_tk_gui():
             "wd_min": 1e-6,
             "wd_max": 1e-2,
             "train_val_split": 0.8,
+            "mixup_alpha": 0.2,
+            "cutmix_alpha": 1.0,
+            "mix_prob": 0.5,
+            "label_smoothing": None,
         }
 
+    # Worker wrapper expects run_arc_tests(cfg_local, emit=emit_to_queue, stop_event=stop_event)
     def worker_fn(cfg_local):
         nonlocal worker_thread, stop_event
         try:
-            emit_to_queue("Starting ARC strict run...")
-            summary = run_arc_tests(cfg_local, emit=emit_to_queue, stop_event=stop_event)
-            emit_to_queue("ARC run finished — summary: " + json.dumps(summary))
+            emit_to_queue("Starting ARC strict run...", "INFO")
+            # If run_arc_tests supports a progress callback, give it a small wrapper:
+            def progress_cb(pct):
+                try:
+                    emit_progress(pct)
+                except Exception:
+                    pass
+            # call run function; allow it to call emit_to_queue for messages
+            summary = run_arc_tests(cfg_local, emit=emit_to_queue, stop_event=stop_event, progress_cb=progress_cb) \
+                if "progress_cb" in run_arc_tests.__code__.co_varnames else run_arc_tests(cfg_local, emit=emit_to_queue, stop_event=stop_event)
+            emit_to_queue("ARC run finished — summary: " + json.dumps(summary), "SUCCESS")
         except Exception as e:
-            emit_to_queue("ARC failure: " + repr(e))
+            emit_to_queue("ARC failure: " + repr(e), "ERROR")
             traceback.print_exc()
         finally:
-            start_btn.config(state="normal")
-            stop_btn.config(state="disabled")
+            # restore UI state on main thread via queue
+            q.put(("MSG", "UI:restore", "INFO"))
 
     def on_start():
         nonlocal worker_thread, stop_event
+        # disable start-only inputs so user can't start twice; keep stop available always
         start_btn.config(state="disabled")
-        stop_btn.config(state="normal")
+        for child in cfg_frame.winfo_children():
+            try:
+                child.configure(state="disabled")
+            except Exception:
+                pass
         stop_event.clear()
         cfg_local = make_cfg()
+        emit_to_queue("Prepared configuration: " + json.dumps({k: cfg_local[k] for k in ("n_examples","batch_size","epochs","latent_dim")}), "INFO")
         worker_thread = threading.Thread(target=worker_fn, args=(cfg_local,), daemon=True)
         worker_thread.start()
+        status_lbl.config(text="Running")
 
     def on_stop():
+        # Always allow stop; don't fully disable it so user can try again if needed
         stop_event.set()
-        emit_to_queue("Stop requested — attempting graceful interruption...")
+        emit_to_queue("Stop requested — attempting graceful interruption...", "WARN")
+        # do NOT disable stop_btn; keep it available as a safety control
 
     def on_quick_test():
         def _qt():
             try:
-                emit_to_queue("Starting quick self-test (ARC-only)...")
+                emit_to_queue("Starting quick self-test (ARC-only)...", "INFO")
                 quick_self_test_arc(emit=emit_to_queue)
-                emit_to_queue("Quick self-test finished.")
+                emit_to_queue("Quick self-test finished.", "SUCCESS")
             except Exception as e:
-                emit_to_queue("Quick self-test failed: " + repr(e))
+                emit_to_queue("Quick self-test failed: " + repr(e), "ERROR")
                 traceback.print_exc()
-        threading.Thread(target=_qt, daemon=True).start()
+        # disable relevant buttons briefly
+        quick_btn.config(state="disabled")
+        threading.Thread(target=lambda: ( _qt(), root.after(100, lambda: quick_btn.config(state="normal")) ), daemon=True).start()
 
+    # Save log button
+    save_log_btn.config(command=save_log_to_file)
+
+    # configure button commands
     start_btn.config(command=on_start)
     stop_btn.config(command=on_stop)
     quick_btn.config(command=on_quick_test)
 
-    root.after(200, poll_queue)
+    # Keyboard shortcuts
+    root.bind_all("<Control-s>", lambda e: save_log_to_file())
+    root.bind_all("<Control-q>", lambda e: root.quit())
+
+    # Start the queue poller
+    root.after(150, poll_queue)
     root.mainloop()
+
+
+
 
 # ------------------------
 # CLI
@@ -658,6 +1259,7 @@ def main_cli():
     except Exception as e:
         print("Run failed:", repr(e))
         traceback.print_exc()
+
 
 if __name__ == "__main__":
     main_cli()
