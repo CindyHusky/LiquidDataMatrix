@@ -4,7 +4,7 @@ The liquid data Matrix allows ai to take in and understand arbitrary data by usi
 I used ai to make the program yes(Deepseek and GPT)
 but i came up with the concept when i misunderstood how lnns work either that or it was a dream- i dont remember-
 
-Either way i pushed forward because of my inferred knowledge that reality is arbitrary, and Darwins uncertainty principle(I would later go onto learn :/..) essentially if you blur the information it becomes more general, and what other way can you do it than a classic gradeschool game of telephone, 2 AI friends with a whiteboard seems like a fitting analogy here.
+Either way i pushed forward because of my inferred knowledge that reality is arbitrary, and Hiesenburg uncertainty principle(I would later go onto learn :/..) essentially if you blur the information it becomes more general, and what other way can you do it than a classic gradeschool game of telephone, 2 AI friends with a whiteboard seems like a fitting analogy here.
 
 ----
 y_out = ψ_read( W_read2 · ψ_read( W_read1 · h_lat + b_read1 ) + b_read2 )
