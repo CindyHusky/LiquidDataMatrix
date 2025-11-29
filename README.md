@@ -12,3 +12,9 @@ It is to my knowledge nobody has tried this!! :)
 https://docs.google.com/document/d/1XZb5JXi3HcbAMMhFzEIpalIXwE36qla2JZPnN9-QQiY/edit?usp=sharing
 
 Heres a link to my pre proof of concept theories, apologies for the lack of legibility...
+
+
+UPDATE: I thought i accidentally reinvented RNNs when i had learned of their existance
+but yall are dumb why arent you doing my thing and only changing the latent memory when the Y on the perceptron is above 0?
+all this state stuff is completely unneccesary 
+Also yall have batch and long term memory problems because you arent using radial blur on the activations within a large data matrix
