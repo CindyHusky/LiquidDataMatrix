@@ -18,3 +18,5 @@ UPDATE: I thought i accidentally reinvented RNNs when i had learned of their exi
 but yall are dumb why arent you doing my thing and only changing the latent memory when the Y on the perceptron is above 0?
 all this state stuff is completely unneccesary 
 Also yall have batch and long term memory problems because you arent using radial blur on the activations within a large data matrix
+
+i have also added my Offical SRBLDM design blueprint as a attempt at a prototype agi kernal
