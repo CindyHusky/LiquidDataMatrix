@@ -15,7 +15,10 @@ Heres a link to my pre proof of concept theories, apologies for the lack of legi
 
 
 UPDATE: I thought i accidentally reinvented RNNs when i had learned of their existance
-but yall are dumb why arent you doing my thing and only changing the latent memory when the Y on the perceptron is above 0?
+
+for some odd reason though none of them use my simple if y <= 0 then leave mememory unchanged
+yknow... how electricity works in the brain, what mf has heard of antienergy and thought it might work in simulating a peice of wetware thats **RELIANT ON ELECTRICITY** smh
+
 all this state stuff is completely unneccesary 
 Also yall have batch and long term memory problems because you arent using radial blur on the activations within a large data matrix
 
