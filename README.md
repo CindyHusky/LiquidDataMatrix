@@ -1,17 +1,15 @@
 # Liquid Data matrix
-The liquid data Matrix allows ai to take in and understand arbitrary data by using a liquid evolving data vector and arbitrary inferrence to abstract useful arbitrary data!
+The liquid data Matrix is an attempt at creating digital wetware
 
-I used ai to make the program yes(Deepseek and GPT)
-but i came up with the concept when i misunderstood how lnns work either that or it was a dream- i dont remember, maybe it was a bit of both its been a minute since..
+I used ai to make the prototypes in the legacy folder on github
+and i came up with the concept when i misremembered/understood how LNNS work..
 
-Either way i pushed forward because of my inferred knowledge that reality is arbitrary, and Hiesenburg uncertainty principle(I would later go onto learn :/..) essentially if you blur the information it becomes more general, and what other way can you do it than a classic gradeschool game of telephone, 2 AI friends with a whiteboard seems like a fitting analogy here.
-(no its not an autoencoder though it looks like one, it uses an arbitrary latant evolving space to store 4d - 1d information).
-
-It is to my knowledge nobody has tried this!! :)
+In my system essentially if you blur the information it becomes more generalised, like pictionary, 2 AI friends with a single whiteboard one always writes and one always interprets and they cant see eachother.(also you cant go below 0 because you cant draw with an eraser)
+(its not an "autoencoder" though because those aren't modeled after literal neurons, this behaves entirely different read further to understand)
 
 https://docs.google.com/document/d/1XZb5JXi3HcbAMMhFzEIpalIXwE36qla2JZPnN9-QQiY/edit?usp=sharing
 
-Heres a link to my pre proof of concept theories, apologies for the lack of legibility...
+Heres a link to my pre proof of concept theories, youre just gonna have to make due with the doctors handwriting style
 
 
 UPDATE: I thought i accidentally reinvented RNNs when i had learned of their existance
