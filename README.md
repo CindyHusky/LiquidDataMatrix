@@ -16,7 +16,7 @@ Heres a link to my pre proof of concept theories, apologies for the lack of legi
 
 UPDATE: I thought i accidentally reinvented RNNs when i had learned of their existance
 
-for some odd reason though none of them use my simple if y <= 0 then leave mememory unchanged
+for some odd reason though none of them use my simple if y <= 0 then leave memory unchanged
 yknow... how electricity works in the brain, what mf has heard of antienergy and thought it might work in simulating a peice of wetware thats **RELIANT ON ELECTRICITY** smh
 
 all this state stuff is completely unneccesary 
